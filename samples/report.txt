@@ -1,0 +1,10 @@
+Synthetic Order Operations
++----------+--------------------------+------------+--------------+
+| ID       | CUSTOMER                 | TOTAL      | STATUS       |
++----------+--------------------------+------------+--------------+
+| A100     | Northwind                | 145.90     | READY        |
+| A101     | Contoso                  | 82.15      | HOLD         |
++----------+--------------------------+------------+--------------+
+Records: 2
+
+Synthetic demonstration data only. Print-friendly plain text.

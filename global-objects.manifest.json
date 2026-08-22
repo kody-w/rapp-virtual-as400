@@ -1,0 +1,28 @@
+{
+  "global_objects": [
+    {
+      "bytes": 2063,
+      "path": "agents/rapp_virtual_as400_agent.py",
+      "sha256": "38fac49e988cf914852b673a0fb5d5ad90d548b1c0ac015c396acb37a9e4f916"
+    },
+    {
+      "bytes": 991,
+      "path": "store.v2.json",
+      "sha256": "e267130165413ca08721a32cf957691cedd67c376c70ad0f53287b434b192b41"
+    },
+    {
+      "bytes": 1088,
+      "path": "LICENSE",
+      "sha256": "a98468bd5ef3925af685e9bc6e79e2c2e2978a28bd9779d8aab84cbd5bed825d"
+    }
+  ],
+  "license_dimension": "MIT",
+  "name": "rapp-virtual-as400",
+  "protocol": "RAPP/1",
+  "schema": "rapp.global-objects/v1",
+  "summon_chant": {
+    "entrypoint": "rapp-virtual-as400 chat",
+    "phrase": "Summon the virtual operations neighborhood.",
+    "ready": true
+  }
+}

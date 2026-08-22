@@ -1,0 +1,120 @@
+# RAPP Virtual AS400
+
+A **clean-room, local, educational prototype** of an operations neighborhood
+inspired by general IBM i / AS/400-era concepts: libraries, declared physical
+files, records, queues, jobs, and spool-like reports.
+
+This project is not IBM software, an IBM i emulator, or an implementation of a
+licensed operating system. It contains no IBM binaries, proprietary code,
+branding claim, or licensed OS artifact. **Do not enter real-system
+credentials or production data. It is not production software.**
+
+## Properties
+
+- Python 3.11+ standard-library-only runtime.
+- Exact local RAPP/1 `POST /chat` response:
+  `{response, agent_logs, session_id}`.
+- Typed `GET /health`; stable HTTP 422 refusal envelope.
+- Atomic JSON persistence in a private `0700` directory with `0600` files.
+- Capability-token shutdown; no PID files or PID-signaling authority.
+- Strict allowlist parser. No shell, SQL, `eval`, filesystem commands,
+  traversal, or outbound network feature exists.
+- Batch transactions roll back on refusal; exact decimals remain strings.
+- Idempotency, durable sessions, concurrency serialization, and bounded data.
+
+## Quick start
+
+No installation is required:
+
+```bash
+PYTHONPATH=src python3 -m rapp_virtual_as400 --home .rapp-virtual-as400 demo
+PYTHONPATH=src python3 -m rapp_virtual_as400 --home .rapp-virtual-as400 \
+  chat "DSPLIB" --session-id cli-1
+```
+
+Install an isolated command if desired:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install .
+rapp-virtual-as400 --home .rapp-virtual-as400 demo
+```
+
+## Exact local RAPP/1 server
+
+```bash
+PYTHONPATH=src python3 -m rapp_virtual_as400 --home .rapp-virtual-as400 serve --port 7084
+
+curl -s http://127.0.0.1:7084/health
+curl -s -X POST http://127.0.0.1:7084/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_input":"DSPLIB","session_id":"demo","idempotency_key":"turn-1"}'
+```
+
+`user_input` is required. `session_id` and `idempotency_key` are optional.
+Successful responses have exactly three top-level fields. Refused requests:
+
+```json
+{
+  "error": {"type": "refusal", "code": "COMMAND_NOT_ALLOWED", "message": "..."},
+  "agent_logs": [],
+  "session_id": "demo"
+}
+```
+
+To stop, read the private capability and present it:
+
+```bash
+TOKEN="$(cat .rapp-virtual-as400/stop.capability)"
+curl -s -X POST http://127.0.0.1:7084/admin/stop \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
+```
+
+## Command neighborhood
+
+```text
+CRTLIB LIB(DEMO)
+CRTPF FILE(DEMO/ITEMS) FIELDS(ID:CHAR(8),QTY:INT,PRICE:DECIMAL(10,2))
+INSERT FILE(DEMO/ITEMS) VALUES(ID='A1',QTY='2',PRICE='10.20')
+UPDATE FILE(DEMO/ITEMS) SET(QTY='3') WHERE(ID='A1')
+SELECT FILE(DEMO/ITEMS) WHERE(ID='A1')
+DISPLAY FILE(DEMO/ITEMS)
+CRTDTAQ DTAQ(DEMO/EVENTS)
+ENQUEUE DTAQ(DEMO/EVENTS) DATA('ready')
+DEQUEUE DTAQ(DEMO/EVENTS)
+CRTJOBQ JOBQ(DEMO/BATCH)
+SUBMIT JOBQ(DEMO/BATCH) CMD("DISPLAY FILE(DEMO/ITEMS)")
+WORK JOBQ(DEMO/BATCH)
+RUN JOB(J000001)
+PRINT FILE(DEMO/ITEMS) TITLE('Synthetic Inventory')
+DSPLIB LIB(DEMO)
+```
+
+Semicolon-separated commands are one transaction. See
+[`docs/COMMANDS.md`](docs/COMMANDS.md) for types and limits.
+
+## RAPP Zoo v2
+
+`agents/rapp_virtual_as400_agent.py` is a single-file BasicAgent-compatible
+adapter. It drives the same engine and accepts `**kwargs`. `store.v2.json`
+provides Store v2 metadata. Build the deterministic global-object manifest:
+
+```bash
+PYTHONPATH=src python3 -m rapp_virtual_as400 manifest --root .
+```
+
+The metadata marks **Summon Chant ready** with the phrase “Summon the virtual
+operations neighborhood.” See [`docs/RAPP_ZOO.md`](docs/RAPP_ZOO.md).
+
+## Test and mutation gates
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -v
+PYTHONPATH=src python3 tools/mutation_gate.py
+```
+
+## License
+
+MIT. IBM, IBM i, and AS/400 are identifiers associated with IBM. Their mention
+describes historical inspiration only and does not imply affiliation,
+endorsement, compatibility certification, or use of IBM materials.

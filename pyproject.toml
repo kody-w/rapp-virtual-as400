@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rapp-virtual-as400"
+version = "0.1.0"
+description = "Clean-room local RAPP/1 virtual operations neighborhood"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "RAPP Virtual AS400 contributors"}]
+keywords = ["rapp", "rapp-1", "operations", "education", "local-first"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Education",
+]
+dependencies = []
+
+[project.scripts]
+rapp-virtual-as400 = "rapp_virtual_as400.cli:main"
+
+[project.urls]
+Repository = "https://github.com/kody-w/rapp-virtual-as400"
+Issues = "https://github.com/kody-w/rapp-virtual-as400/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

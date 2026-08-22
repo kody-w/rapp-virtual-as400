@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "id": "@kody-w/rapp-virtual-as400",
+  "name": "RAPP Virtual AS400",
+  "version": "0.1.0",
+  "summary": "Clean-room local educational operations neighborhood over exact RAPP/1.",
+  "license": "MIT",
+  "visibility": "public",
+  "runtime": {
+    "language": "python",
+    "requires": ">=3.11",
+    "dependencies": "stdlib-only"
+  },
+  "protocols": [
+    {
+      "name": "RAPP/1",
+      "transport": "local-http",
+      "endpoint": "POST /chat"
+    }
+  ],
+  "agent": "agents/rapp_virtual_as400_agent.py",
+  "entrypoint": "rapp-virtual-as400",
+  "capabilities": [
+    "virtual-libraries",
+    "declared-physical-files",
+    "records",
+    "data-queues",
+    "job-queues",
+    "spool-reports"
+  ],
+  "boundaries": {
+    "prototype": true,
+    "production_ready": false,
+    "accepts_real_system_credentials": false,
+    "includes_proprietary_artifacts": false
+  },
+  "summon_chant": {
+    "ready": true,
+    "phrase": "Summon the virtual operations neighborhood."
+  }
+}

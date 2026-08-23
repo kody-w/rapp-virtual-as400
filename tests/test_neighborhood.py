@@ -10,7 +10,11 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from rapp_virtual_as400 import PrivateVNetNeighborhood, Refusal, VirtualAS400
-from rapp_virtual_as400.storage import AtomicStore, empty_state
+from rapp_virtual_as400.storage import (
+    AtomicStore,
+    empty_state,
+    encode_idempotency_identity,
+)
 import rapp_virtual_as400.neighborhood as neighborhood_module
 
 from .support import EngineTestCase
@@ -542,6 +546,107 @@ class NeighborhoodTests(EngineTestCase):
         self.assertEqual(reopened.write_snapshot_bundle("intent-1.json", first), reference)
         self.assertEqual(reopened.read(), [])
         self.assertEqual(reopened.read_snapshot_bundle(reference), first)
+
+    def test_legacy_bundle_keeps_raw_evidence_and_recovers_migrated_state(self) -> None:
+        root = self.work / "legacy-evidence"
+        events_path = root / "evidence" / "events.jsonl"
+        ledger = neighborhood_module.EvidenceLedger(events_path)
+        legacy = empty_state()
+        legacy["revision"] = 1
+        legacy["sessions"]["a:b"] = {
+            "turns": [
+                {
+                    "at": "2000-01-01T00:00:00+00:00",
+                    "input": "DSPLIB",
+                    "response": "Libraries: none",
+                }
+            ]
+        }
+        legacy["idempotency"]["a:b:c"] = {
+            "request_hash": hashlib.sha256(b"DSPLIB").hexdigest(),
+            "result": {
+                "response": "Libraries: none",
+                "agent_logs": [{"command": "DSPLIB", "status": "ok"}],
+                "session_id": "a:b",
+            },
+        }
+        raw_hash = neighborhood_module._digest(legacy)
+        bundle = {
+            "pre_snapshots": {
+                "AS400-A": copy.deepcopy(legacy),
+                "AS400-B": copy.deepcopy(legacy),
+            },
+            "pre_state_hashes": {
+                "AS400-A": raw_hash,
+                "AS400-B": raw_hash,
+            },
+        }
+        reference = ledger.write_snapshot_bundle("intent-1.json", bundle)
+        bundle_path = events_path.parent / reference["path"]
+        raw_bytes = bundle_path.read_bytes()
+        self.assertEqual(hashlib.sha256(raw_bytes).hexdigest(), reference["sha256"])
+        self.assertEqual(len(raw_bytes), reference["bytes"])
+        message = {
+            "protocol": "RAPP/1",
+            "kind": "chat",
+            "user_input": "DSPLIB",
+            "session_id": "a:b",
+            "idempotency_key": "c",
+            "event_at": "2000-01-01T00:00:00.000001+00:00",
+        }
+        ledger.append(
+            {
+                "type": "replicated_chat_intent",
+                "message": message,
+                "nodes": ["AS400-A", "AS400-B"],
+                "snapshot_bundle_path": reference["path"],
+                "snapshot_bundle": reference,
+                "pre_state_hashes": bundle["pre_state_hashes"],
+                "terminal_sequence": 2,
+            }
+        )
+        for node_id in ("AS400-A", "AS400-B"):
+            state_path = root / "nodes" / node_id / "state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps(empty_state(), sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+        canonical = encode_idempotency_identity("a:b", "c")
+        with PrivateVNetNeighborhood(root) as recovered:
+            states = recovered._snapshots()
+            for state in states.values():
+                self.assertNotIn("a:b:c", state["idempotency"])
+                self.assertIn(canonical, state["idempotency"])
+            terminal = recovered.ledger.audit()[-1]["record"]
+            migrated_hash = neighborhood_module._digest(states["AS400-A"])
+            self.assertEqual(terminal["pre_state_hashes"], bundle["pre_state_hashes"])
+            self.assertEqual(
+                terminal["restored_state_hashes"],
+                {"AS400-A": migrated_hash, "AS400-B": migrated_hash},
+            )
+
+        self.assertEqual(bundle_path.read_bytes(), raw_bytes)
+        self.assertEqual(
+            hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+            reference["sha256"],
+        )
+        persisted_bundle = json.loads(bundle_path.read_bytes())
+        self.assertIn("a:b:c", persisted_bundle["pre_snapshots"]["AS400-A"]["idempotency"])
+        self.assertNotIn(
+            canonical,
+            persisted_bundle["pre_snapshots"]["AS400-A"]["idempotency"],
+        )
+        with PrivateVNetNeighborhood(root) as reopened:
+            self.assertEqual(len(reopened.ledger.audit()), 2)
+            self.assertIn(canonical, reopened._snapshots()["AS400-A"]["idempotency"])
+
+        tampered = raw_bytes.replace(b"a:b:c", b"a:b:d", 1)
+        self.assertNotEqual(tampered, raw_bytes)
+        bundle_path.write_bytes(tampered)
+        with self.assertRaisesRegex(Refusal, "digest"):
+            neighborhood_module.EvidenceLedger(events_path).read_snapshot_bundle(reference)
 
     def test_unmatched_intent_recovers_on_open_then_converges_and_replays(self) -> None:
         root = self.work / "crash-recovery"

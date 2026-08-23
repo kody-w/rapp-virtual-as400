@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -327,6 +328,14 @@ class EvidenceLedger:
                 bundle = self.read_snapshot_bundle(record.get("snapshot_bundle"))
                 if bundle["pre_state_hashes"] != record.get("pre_state_hashes"):
                     raise Refusal("Terminal evidence pre-state hashes diverge.", "EVIDENCE_INVALID")
+                runtime_hashes = {
+                    node_id: _digest(snapshot)
+                    for node_id, snapshot in bundle["pre_snapshots"].items()
+                }
+                valid_restore_hashes = (
+                    bundle["pre_state_hashes"],
+                    runtime_hashes,
+                )
                 restore = record.get("restore")
                 if (
                     not isinstance(restore, dict)
@@ -374,19 +383,16 @@ class EvidenceLedger:
                     ):
                         raise Refusal("Commit convergence evidence is invalid.", "EVIDENCE_INVALID")
                 elif record_type == "replicated_chat_recovery":
-                    expected_hashes = intent["record"]["pre_state_hashes"]
+                    restored_state_hashes = record.get("restored_state_hashes")
                     if (
-                        restore
-                        != {
-                            "status": "verified",
-                            "state_hashes": expected_hashes,
-                            "failures": [],
-                        }
-                        or record.get("restored_state_hashes") != expected_hashes
+                        restore["status"] != "verified"
+                        or restore["failures"] != []
+                        or restore["state_hashes"] != restored_state_hashes
+                        or restored_state_hashes not in valid_restore_hashes
                         or record.get("rollback_verified") is not True
                         or record.get("rollback_failures") != []
                         or record.get("converged") is not True
-                        or len(set(expected_hashes.values())) != 1
+                        or len(set(restored_state_hashes.values())) != 1
                     ):
                         raise Refusal("Recovery terminal evidence is invalid.", "EVIDENCE_INVALID")
                 else:
@@ -410,15 +416,16 @@ class EvidenceLedger:
                         if rollback_verified
                         else "failed"
                     )
-                    expected_hashes = intent["record"]["pre_state_hashes"]
                     if (
                         restore["status"] != expected_restore
                         or (
                             rollback_required
                             and rollback_verified
                             and (
-                                record["restored_state_hashes"] != expected_hashes
-                                or restore["state_hashes"] != expected_hashes
+                                record["restored_state_hashes"]
+                                not in valid_restore_hashes
+                                or restore["state_hashes"]
+                                != record["restored_state_hashes"]
                                 or record["rollback_failures"]
                                 or restore["failures"]
                             )
@@ -656,9 +663,10 @@ class EvidenceLedger:
             ):
                 raise Refusal("Snapshot bundle schema is invalid.", "EVIDENCE_INVALID")
             for node_id, snapshot in bundle["pre_snapshots"].items():
-                validated = AtomicStore.validate_snapshot(snapshot)
-                if bundle["pre_state_hashes"].get(node_id) != _digest(validated):
+                validated = AtomicStore.validate_snapshot(copy.deepcopy(snapshot))
+                if bundle["pre_state_hashes"].get(node_id) != _digest(snapshot):
                     raise Refusal("Snapshot bundle state hash is invalid.", "EVIDENCE_INVALID")
+                bundle["pre_snapshots"][node_id] = validated
             return bundle
 
 
@@ -809,10 +817,14 @@ class PrivateVNetNeighborhood:
             )
         bundle = self.ledger.read_snapshot_bundle(record["snapshot_bundle"])
         snapshots = bundle["pre_snapshots"]
-        expected_hashes = bundle["pre_state_hashes"]
+        evidence_hashes = bundle["pre_state_hashes"]
+        expected_hashes = {
+            node_id: _digest(snapshot) for node_id, snapshot in snapshots.items()
+        }
         if (
             set(snapshots) != set(self.nodes)
-            or expected_hashes != record["pre_state_hashes"]
+            or evidence_hashes != record["pre_state_hashes"]
+            or len(set(evidence_hashes.values())) != 1
             or len(set(expected_hashes.values())) != 1
         ):
             raise Refusal(
@@ -831,7 +843,7 @@ class PrivateVNetNeighborhood:
             "intent_event_hash": intent["event_hash"],
             "message": record["message"],
             "snapshot_bundle": record["snapshot_bundle"],
-            "pre_state_hashes": expected_hashes,
+            "pre_state_hashes": evidence_hashes,
             "restored_state_hashes": restored_hashes,
             "rollback_verified": True,
             "rollback_failures": [],

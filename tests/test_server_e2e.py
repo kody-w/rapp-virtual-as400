@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 
 from rapp_virtual_as400.server import RAPPServer
+from rapp_virtual_as400.storage import MAX_PERSISTED_STATE_BYTES, empty_state
 
 from .support import EngineTestCase
 
@@ -177,6 +178,66 @@ class ServerE2ETests(EngineTestCase):
         self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
         self.assertEqual(body["error"]["message"], "Request contains malformed Unicode.")
         self.assertEqual(set(body), {"error", "agent_logs", "session_id"})
+
+    def test_persisted_byte_limit_refuses_select_atomically_and_restarts(self) -> None:
+        fields = [
+            {"name": f"F{index:02d}", "type": "CHAR", "precision": 256, "scale": 0}
+            for index in range(15)
+        ]
+        record = {f"F{index:02d}": "x" * 256 for index in range(15)}
+        insert = "INSERT FILE(BIG/ROWS) VALUES(" + ",".join(
+            f"F{index:02d}='{'x' * 256}'" for index in range(15)
+        ) + ")"
+        state = empty_state()
+        state["revision"] = 1
+        state["libraries"]["BIG"] = {
+            "files": {
+                "ROWS": {
+                    "fields": fields,
+                    "records": [record.copy() for _ in range(900)],
+                }
+            }
+        }
+        state["sessions"]["bulk"] = {
+            "turns": [
+                {
+                    "at": "2000-01-01T00:00:00+00:00",
+                    "input": insert,
+                    "response": "1 record inserted into BIG/ROWS.",
+                }
+                for _ in range(100)
+            ]
+        }
+        self.server.engine.store.restore(state)
+        state_path = self.work / "http-state.json"
+        before_bytes = state_path.read_bytes()
+        before_state = self.server.engine.store.snapshot()
+        self.assertLess(len(before_bytes), MAX_PERSISTED_STATE_BYTES)
+        self.assertGreater(len(before_bytes), MAX_PERSISTED_STATE_BYTES - 250_000)
+
+        status, body = self.request(
+            "/chat",
+            {"user_input": "SELECT FILE(BIG/ROWS)", "session_id": "select"},
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "LIMIT_EXCEEDED")
+        self.assertEqual(body["session_id"], "select")
+        self.assertEqual(state_path.read_bytes(), before_bytes)
+        self.assertEqual(self.server.engine.store.snapshot(), before_state)
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = RAPPServer(
+            ("127.0.0.1", 0),
+            state_path,
+            self.work / "stop.capability",
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.assertEqual(self.request("/health")[0], 200)
+        self.assertEqual(self.server.engine.store.snapshot(), before_state)
 
     def test_stop_requires_capability_not_pid(self) -> None:
         status, _ = self.request("/admin/stop", {})

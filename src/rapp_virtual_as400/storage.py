@@ -26,7 +26,8 @@ try:
 except ImportError:  # pragma: no cover - POSIX
     msvcrt = None
 
-MAX_RESTORE_SNAPSHOT_BYTES = 4 * 1024 * 1024
+MAX_PERSISTED_STATE_BYTES = 4 * 1024 * 1024
+MAX_RESTORE_SNAPSHOT_BYTES = MAX_PERSISTED_STATE_BYTES
 MAX_SNAPSHOT_DEPTH = 32
 MAX_SIX_DIGIT_ID = 999_999
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -150,6 +151,25 @@ def decode_idempotency_identity(value: object) -> tuple[str, str]:
     return decoded[0], decoded[1]
 
 
+def _serialized_state_bytes(state: object) -> bytes:
+    try:
+        encoded = json.dumps(
+            state,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise Refusal("Persisted state must be canonical JSON.", "INVALID_SNAPSHOT") from None
+    if len(encoded) > MAX_PERSISTED_STATE_BYTES:
+        raise Refusal(
+            "Persisted state exceeds the serialized byte limit.",
+            "LIMIT_EXCEEDED",
+        )
+    return encoded
+
+
 class AtomicStore:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -174,12 +194,13 @@ class AtomicStore:
             return json.load(handle)
 
     def _write(self, state: dict) -> None:
+        encoded = _serialized_state_bytes(state)
         temp = self.path.with_suffix(self.path.suffix + ".new")
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         descriptor = os.open(temp, flags, 0o600)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temp, 0o600)
@@ -248,17 +269,19 @@ class AtomicStore:
             elif value is not None and not isinstance(value, (str, int, bool)):
                 raise Refusal("Restore snapshot contains a non-JSON value.", "INVALID_SNAPSHOT")
         try:
-            encoded = json.dumps(
-                snapshot,
-                allow_nan=False,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError, UnicodeError):
+            encoded = _serialized_state_bytes(snapshot)
+        except Refusal as error:
+            if error.code == "LIMIT_EXCEEDED":
+                raise Refusal(
+                    "Restore snapshot exceeds the bounded restore limit.",
+                    "LIMIT_EXCEEDED",
+                ) from None
             raise Refusal("Restore snapshot must be canonical JSON.", "INVALID_SNAPSHOT") from None
         if len(encoded) > MAX_RESTORE_SNAPSHOT_BYTES:
-            raise Refusal("Restore snapshot exceeds the bounded restore limit.", "LIMIT_EXCEEDED")
+            raise Refusal(
+                "Restore snapshot exceeds the bounded restore limit.",
+                "LIMIT_EXCEEDED",
+            )
 
         def exact_mapping(value: object, keys: set[str]) -> bool:
             return isinstance(value, dict) and set(value) == keys
@@ -550,6 +573,12 @@ class AtomicStore:
         ):
             invalid("Restore snapshot has an incoherent revision.")
 
+        migrated = _serialized_state_bytes(snapshot)
+        if len(migrated) > MAX_RESTORE_SNAPSHOT_BYTES:
+            raise Refusal(
+                "Restore snapshot exceeds the bounded restore limit.",
+                "LIMIT_EXCEEDED",
+            )
         return copy.deepcopy(snapshot)
 
     @contextmanager

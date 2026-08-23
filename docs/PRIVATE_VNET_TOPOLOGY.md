@@ -69,7 +69,11 @@ every intent and rejects orphan, duplicate, or mismatched terminals.
 
 Restore snapshots use strict schema, type/value/limit, object-name,
 counter/revision, queue/job referential, depth, and size validation before
-atomic private writes. Unexpected engine failures are returned as stable
+atomic private writes. Their 4 MiB canonical serialized-state limit is the
+same cap enforced before every normal state write and transaction commit; the
+restore pipe admits that state plus only its bounded control envelope.
+Over-limit growth returns `LIMIT_EXCEEDED` without changing the prior state
+revision or file bytes. Unexpected engine failures are returned as stable
 `WORKER_ERROR` refusals without turning failures into successes.
 
 Terminal records do not duplicate snapshots. They retain only an immutable
@@ -79,6 +83,13 @@ reject absolute/traversing/symlinked bundle paths, missing bundles, digest or
 size changes, and malformed bundle snapshots. The configured evidence byte
 cap covers both JSONL and bundles, each JSONL record has its own bound, and
 capacity failure occurs before mutation.
+
+For pre-upgrade bundles, audit first validates the exact raw snapshot and
+checks its recorded hash against that unmodified representation. Legacy
+idempotency identities are migrated only in a separate deep copy used for
+restore/runtime. The immutable bundle bytes, path, size, digest, and recorded
+raw state hashes are never rewritten; current-format bundles still read back
+exactly.
 
 `replay_and_verify()` resets one selected node through its fixed typed control
 operation, verifies the complete evidence hash chain and referenced bundles,

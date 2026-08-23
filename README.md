@@ -37,7 +37,9 @@ credentials or production data. It is not production software.**
   terminal slot reserved by that intent.
 - Strict restore validation covers object grammar, schema/value limits,
   counters, revisions, and queue/job referential integrity before atomic
-  replacement. Unexpected worker errors become stable refusals.
+  replacement. The same 4 MiB canonical serialized-state cap is checked before
+  every atomic write and transaction commit; rejected growth leaves the prior
+  revision and bytes intact. Unexpected worker errors become stable refusals.
 - Evidence proves deterministic replication, replay, and convergence,
   including a 100-replica release proof.
 

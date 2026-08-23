@@ -424,6 +424,50 @@ MUTATIONS = [
             "raise SystemExit(0 if good else 1)\n"
         ),
     ),
+    Mutation(
+        "raw-hash-before-legacy-migration",
+        "neighborhood.py",
+        'if bundle["pre_state_hashes"].get(node_id) != _digest(snapshot):',
+        'if bundle["pre_state_hashes"].get(node_id) != _digest(validated):',
+        (
+            "from pathlib import Path\n"
+            "import hashlib,json\n"
+            "from rapp_virtual_as400.neighborhood import EvidenceLedger\n"
+            "from rapp_virtual_as400.storage import empty_state,encode_idempotency_identity\n"
+            "s=empty_state(); s['revision']=1; s['idempotency']['a:b:c']={"
+            "'request_hash':hashlib.sha256(b'DSPLIB').hexdigest(),"
+            "'result':{'response':'ok','agent_logs':[{'command':'DSPLIB','status':'ok'}],"
+            "'session_id':'a:b'}}\n"
+            "raw=json.dumps(s,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()\n"
+            "bundle={'pre_snapshots':{'AS400-A':s},"
+            "'pre_state_hashes':{'AS400-A':hashlib.sha256(raw).hexdigest()}}\n"
+            "ledger=EvidenceLedger(Path('evidence/events.jsonl'))\n"
+            "ref=ledger.write_snapshot_bundle('intent-1.json',bundle)\n"
+            "read=ledger.read_snapshot_bundle(ref)\n"
+            "key=encode_idempotency_identity('a:b','c')\n"
+            "raise SystemExit(0 if key in read['pre_snapshots']['AS400-A']['idempotency'] "
+            "and ledger.path.parent.joinpath(ref['path']).read_bytes()=="
+            "json.dumps(bundle,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode() else 1)\n"
+        ),
+    ),
+    Mutation(
+        "persisted-byte-write-preflight",
+        "storage.py",
+        "    if len(encoded) > MAX_PERSISTED_STATE_BYTES:",
+        "    if False:",
+        (
+            "from pathlib import Path\n"
+            "import rapp_virtual_as400.storage as m\n"
+            "from rapp_virtual_as400 import Refusal,VirtualAS400\n"
+            "path=Path('state.json'); engine=VirtualAS400(path); before=path.read_bytes()\n"
+            "m.MAX_PERSISTED_STATE_BYTES=len(before)+10\n"
+            "try:\n"
+            " with engine.store.transaction() as state: state['sessions']['growth']={'turns':[]}\n"
+            "except Refusal as error:\n"
+            " raise SystemExit(0 if error.code=='LIMIT_EXCEEDED' and path.read_bytes()==before else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
 ]
 
 

@@ -33,6 +33,13 @@ six-digit values (`J000001`..`J999999` and `S000001`..`S999999`). Their final
 values are valid durable state; later `SUBMIT` or `PRINT` requests are refused
 with `LIMIT_EXCEEDED` without changing that state.
 
+The complete persisted state has a 4 MiB canonical UTF-8 JSON limit. That is
+also the maximum restore snapshot size; the fixed worker restore transport
+allows that state plus its bounded RAPP/1 control envelope. Every atomic
+write, including each chat transaction commit, checks the serialized bytes
+before touching the state file. Growth beyond the cap returns
+`LIMIT_EXCEEDED` and preserves the prior file bytes and revision.
+
 The parser only dispatches named handlers. There is no general interpreter,
 shell subprocess, SQL parser, Python evaluation, path argument, socket client,
 or arbitrary network operation. Submitted jobs store one already-allowlisted

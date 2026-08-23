@@ -534,7 +534,10 @@ class EvidenceLedger:
         if not synchronized:
             descriptor = -1
             try:
-                descriptor = os.open(self.path, os.O_RDWR)
+                descriptor = os.open(
+                    self.path,
+                    os.O_RDWR | getattr(os, "O_BINARY", 0),
+                )
                 os.fsync(descriptor)
                 synchronized = True
             except OSError:
@@ -587,7 +590,11 @@ class EvidenceLedger:
                 or private_mode_mismatch(metadata.st_mode, 0o600)
             ):
                 raise Refusal("Evidence file permissions are unsafe.", "EVIDENCE_INVALID")
-            descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND, 0o600)
+            descriptor = os.open(
+                self.path,
+                os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
             original_size = os.fstat(descriptor).st_size
             publication_attempted = False
             synchronized = False
@@ -689,7 +696,12 @@ class EvidenceLedger:
                 raise Refusal("Evidence byte limit reached.", "LIMIT_EXCEEDED")
 
             temporary = self._snapshots_path / f".{filename}.{uuid.uuid4().hex}.tmp"
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+            )
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = -1

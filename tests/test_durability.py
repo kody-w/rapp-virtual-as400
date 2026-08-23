@@ -152,6 +152,37 @@ class DirectoryDurabilityContractTests(unittest.TestCase):
             )
         self.assertEqual(destination.read_bytes(), original)
 
+    def test_simulated_windows_evidence_uses_binary_descriptors(self) -> None:
+        ledger = neighborhood_module.EvidenceLedger(
+            self.work / "binary-ledger" / "events.jsonl"
+        )
+        binary_flag = 0x8000
+        real_open = os.open
+        evidence_flags: list[int] = []
+
+        def windows_open(path, flags, mode=0o777, *, dir_fd=None):
+            if os.fspath(path) == os.fspath(ledger.path):
+                evidence_flags.append(flags)
+            return real_open(path, flags & ~binary_flag, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(
+                neighborhood_module.os,
+                "O_BINARY",
+                binary_flag,
+                create=True,
+            ),
+            mock.patch.object(
+                neighborhood_module.os,
+                "open",
+                side_effect=windows_open,
+            ),
+        ):
+            ledger.append({"type": "binary"})
+
+        self.assertTrue(evidence_flags)
+        self.assertTrue(all(flags & binary_flag for flags in evidence_flags))
+
 
 if __name__ == "__main__":
     unittest.main()

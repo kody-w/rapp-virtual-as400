@@ -51,6 +51,20 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "structured-idempotency-identity",
+        "engine.py",
+        "encode_idempotency_identity(session_id, idempotency_key)",
+        'f"{session_id}:{idempotency_key}"',
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import VirtualAS400\n"
+            "e=VirtualAS400(Path('state.json'))\n"
+            "a=e.chat('CRTLIB LIB(LEFT)','a:b','c')\n"
+            "b=e.chat('CRTLIB LIB(RIGHT)','a','b:c')\n"
+            "raise SystemExit(0 if a['session_id']=='a:b' and b['session_id']=='a' else 1)\n"
+        ),
+    ),
+    Mutation(
         "record-limit",
         "engine.py",
         'if len(file["records"]) >= MAX_RECORDS_PER_FILE:',
@@ -384,6 +398,30 @@ MUTATIONS = [
             "m._fsync_directory=lambda path: called.append(path)\n"
             "ledger.write_snapshot_bundle('intent-1.json',{'pre_snapshots':{},'pre_state_hashes':{}})\n"
             "raise SystemExit(0 if ledger._snapshots_path in called else 1)\n"
+        ),
+    ),
+    Mutation(
+        "open-time-intent-recovery",
+        "neighborhood.py",
+        "                self._recover_unmatched_intent()",
+        "                pass",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "root=Path('vnet'); n=PrivateVNetNeighborhood(root)\n"
+            "node=n.nodes['AS400-A']; original=node.request\n"
+            "def crash(message):\n"
+            " response=original(message)\n"
+            " if message.get('kind')=='chat': raise SystemExit()\n"
+            " return response\n"
+            "node.request=crash\n"
+            "try: n.replicate_chat('CRTLIB LIB(CRASHED)','crash','crash')\n"
+            "except SystemExit: pass\n"
+            "n.close()\n"
+            "with PrivateVNetNeighborhood(root) as recovered:\n"
+            " states=recovered._snapshots(); types=[e['record']['type'] for e in recovered.ledger.read()]\n"
+            " good=states['AS400-A']==states['AS400-B'] and not states['AS400-A']['libraries'] and types==['replicated_chat_intent','replicated_chat_recovery']\n"
+            "raise SystemExit(0 if good else 1)\n"
         ),
     ),
 ]

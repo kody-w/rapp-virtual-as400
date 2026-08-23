@@ -4,7 +4,11 @@ import copy
 import json
 
 from rapp_virtual_as400 import PrivateVNetNeighborhood, Refusal, VirtualAS400
-from rapp_virtual_as400.storage import AtomicStore, empty_state
+from rapp_virtual_as400.storage import (
+    AtomicStore,
+    empty_state,
+    encode_idempotency_identity,
+)
 
 from .support import EngineTestCase
 
@@ -113,6 +117,40 @@ class RestoreValidationTests(EngineTestCase):
             with self.subTest(command=command):
                 response = target.chat(command, "after")
                 self.assertEqual(set(response), {"response", "agent_logs", "session_id"})
+
+    def test_legacy_idempotency_identity_migrates_or_fails_closed(self) -> None:
+        self.engine.chat("CRTLIB LIB(LEGACY)", "a:b", "c")
+        state = self.engine.store.snapshot()
+        canonical = encode_idempotency_identity("a:b", "c")
+        cached = state["idempotency"].pop(canonical)
+        state["idempotency"]["a:b:c"] = cached
+
+        migrated = AtomicStore.validate_snapshot(state)
+        self.assertNotIn("a:b:c", migrated["idempotency"])
+        self.assertEqual(migrated["idempotency"][canonical], cached)
+        restored_path = self.work / "legacy" / "state.json"
+        restored_path.parent.mkdir()
+        restored_path.write_text(
+            json.dumps(state, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        restored = VirtualAS400(restored_path)
+        self.assertEqual(
+            restored.chat("CRTLIB LIB(LEGACY)", "a:b", "c")["session_id"],
+            "a:b",
+        )
+        self.assertIn(canonical, json.loads(restored_path.read_text())["idempotency"])
+
+        irreconcilable = copy.deepcopy(state)
+        irreconcilable["idempotency"]["a:b:c"]["result"]["session_id"] = "z"
+        with self.assertRaisesRegex(Refusal, "ambiguous legacy"):
+            AtomicStore.validate_snapshot(irreconcilable)
+
+        conflicting = copy.deepcopy(state)
+        conflicting["idempotency"][canonical] = copy.deepcopy(cached)
+        conflicting["idempotency"][canonical]["request_hash"] = "0" * 64
+        with self.assertRaisesRegex(Refusal, "conflicting"):
+            AtomicStore.validate_snapshot(conflicting)
 
     def test_worker_converts_unexpected_engine_error_to_stable_refusal_and_survives(self) -> None:
         with PrivateVNetNeighborhood(self.work / "worker") as neighborhood:

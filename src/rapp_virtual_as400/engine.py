@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .errors import Refusal
 from .parser import Command, parse_batch, parse_pairs, require_name, require_qualified, unquote
-from .storage import AtomicStore, MAX_SIX_DIGIT_ID
+from .storage import AtomicStore, MAX_SIX_DIGIT_ID, encode_idempotency_identity
 from .unicode_safe import canonical_unicode
 
 MAX_LIBRARIES = 64
@@ -97,11 +97,20 @@ class VirtualAS400:
         if idempotency_key is not None:
             if not isinstance(idempotency_key, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", idempotency_key):
                 raise Refusal("idempotency_key has an invalid format.", "INVALID_REQUEST")
-        cache_key = f"{session_id}:{idempotency_key}" if idempotency_key else None
+        cache_key = (
+            encode_idempotency_identity(session_id, idempotency_key)
+            if idempotency_key
+            else None
+        )
 
         with self.store.transaction() as state:
             if cache_key and cache_key in state["idempotency"]:
                 cached = state["idempotency"][cache_key]
+                if cached.get("result", {}).get("session_id") != session_id:
+                    raise Refusal(
+                        "Idempotency cache session identity diverged.",
+                        "IDEMPOTENCY_CONFLICT",
+                    )
                 if cached["request_hash"] != request_hash:
                     raise Refusal("Idempotency key was already used for different input.", "IDEMPOTENCY_CONFLICT")
                 return cached["result"]

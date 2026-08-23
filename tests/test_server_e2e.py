@@ -56,6 +56,28 @@ class ServerE2ETests(EngineTestCase):
         self.assertEqual(set(body), {"response", "agent_logs", "session_id"})
         self.assertEqual(body["session_id"], "web")
 
+    def test_live_chat_colon_identities_repeat_and_conflict_independently(self) -> None:
+        left = {
+            "user_input": "CRTLIB LIB(LEFT)",
+            "session_id": "a:b",
+            "idempotency_key": "c",
+        }
+        right = {
+            "user_input": "CRTLIB LIB(RIGHT)",
+            "session_id": "a",
+            "idempotency_key": "b:c",
+        }
+        self.assertEqual(self.request("/chat", left)[0], 200)
+        self.assertEqual(self.request("/chat", right)[0], 200)
+        self.assertEqual(self.request("/chat", left)[1]["session_id"], "a:b")
+        self.assertEqual(self.request("/chat", right)[1]["session_id"], "a")
+        for payload in (left, right):
+            conflict = {**payload, "user_input": "DSPLIB"}
+            status, body = self.request("/chat", conflict)
+            self.assertEqual(status, 422)
+            self.assertEqual(body["error"]["code"], "IDEMPOTENCY_CONFLICT")
+            self.assertEqual(body["session_id"], payload["session_id"])
+
     def test_exact_422_refusal_envelope(self) -> None:
         status, body = self.request("/chat", {})
         self.assertEqual(status, 422)

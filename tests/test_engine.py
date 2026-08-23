@@ -4,7 +4,7 @@ import json
 import os
 
 from rapp_virtual_as400 import Refusal, VirtualAS400
-from rapp_virtual_as400.storage import AtomicStore
+from rapp_virtual_as400.storage import AtomicStore, encode_idempotency_identity
 
 from .support import EngineTestCase
 
@@ -76,6 +76,33 @@ class EngineTests(EngineTestCase):
         with self.assertRaisesRegex(Refusal, "different input"):
             self.engine.chat("CRTLIB LIB(OTHER)", "session-a", "key-1")
         self.assertEqual(len(self.engine.store.snapshot()["sessions"]["session-a"]["turns"]), 1)
+
+    def test_colons_cannot_alias_idempotency_identity_or_leak_session(self) -> None:
+        left = self.engine.chat("CRTLIB LIB(LEFT)", "a:b", "c")
+        right = self.engine.chat("CRTLIB LIB(RIGHT)", "a", "b:c")
+        self.assertEqual(left["session_id"], "a:b")
+        self.assertEqual(right["session_id"], "a")
+        self.assertEqual(self.engine.chat("CRTLIB LIB(LEFT)", "a:b", "c"), left)
+        self.assertEqual(self.engine.chat("CRTLIB LIB(RIGHT)", "a", "b:c"), right)
+        with self.assertRaisesRegex(Refusal, "different input"):
+            self.engine.chat("DSPLIB", "a:b", "c")
+        with self.assertRaisesRegex(Refusal, "different input"):
+            self.engine.chat("DSPLIB", "a", "b:c")
+
+        state = self.engine.store.snapshot()
+        self.assertEqual(
+            set(state["idempotency"]),
+            {
+                encode_idempotency_identity("a:b", "c"),
+                encode_idempotency_identity("a", "b:c"),
+            },
+        )
+        with self.engine.store.transaction() as working:
+            working["idempotency"][encode_idempotency_identity("a:b", "c")]["result"][
+                "session_id"
+            ] = "a"
+        with self.assertRaisesRegex(Refusal, "session identity diverged"):
+            self.engine.chat("CRTLIB LIB(LEFT)", "a:b", "c")
 
     def test_private_file_modes(self) -> None:
         mode = os.stat(self.work / "state.json").st_mode & 0o777

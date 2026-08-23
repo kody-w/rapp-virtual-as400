@@ -235,15 +235,80 @@ class EvidenceLedger:
             self._previous = previous
             return entries
 
-    def audit(self) -> list[dict]:
+    def _audit_transactions(self, allow_unmatched: bool) -> tuple[list[dict], list[dict]]:
         entries = self.read()
         with self.transaction_lock:
             if self._scan_bundle_bytes() != self._read_bundle_bytes():
                 raise Refusal("Snapshot evidence byte metadata diverged.", "EVIDENCE_INVALID")
         by_sequence = {entry["sequence"]: entry for entry in entries}
+        intents: dict[int, dict] = {}
+        terminals: dict[int, list[dict]] = {}
         for entry in entries:
             record = entry["record"]
-            if record.get("type") in {"replicated_chat_commit", "replicated_chat_failure"}:
+            record_type = record.get("type")
+            if record_type == "replicated_chat_intent":
+                reference = record.get("snapshot_bundle")
+                nodes = record.get("nodes")
+                pre_state_hashes = record.get("pre_state_hashes")
+                message = record.get("message")
+                if (
+                    not isinstance(reference, dict)
+                    or reference.get("path")
+                    != f"snapshots/intent-{entry['sequence']}.json"
+                    or not isinstance(message, dict)
+                    or set(message)
+                    != {
+                        "protocol",
+                        "kind",
+                        "user_input",
+                        "session_id",
+                        "idempotency_key",
+                        "event_at",
+                    }
+                    or message.get("protocol") != "RAPP/1"
+                    or message.get("kind") != "chat"
+                    or any(
+                        not isinstance(message.get(field), str)
+                        for field in (
+                            "user_input",
+                            "session_id",
+                            "idempotency_key",
+                            "event_at",
+                        )
+                    )
+                    or not isinstance(nodes, list)
+                    or not 2 <= len(nodes) <= MAX_NODES
+                    or len(set(nodes)) != len(nodes)
+                    or any(
+                        not isinstance(node_id, str) or NODE_RE.fullmatch(node_id) is None
+                        for node_id in nodes
+                    )
+                    or not isinstance(pre_state_hashes, dict)
+                    or set(pre_state_hashes) != set(nodes)
+                    or any(
+                        not isinstance(digest, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                        for digest in pre_state_hashes.values()
+                    )
+                    or record.get("terminal_sequence") != entry["sequence"] + 1
+                    or record.get("snapshot_bundle_path")
+                    != reference.get("path")
+                ):
+                    raise Refusal("Replication intent evidence is invalid.", "EVIDENCE_INVALID")
+                bundle = self.read_snapshot_bundle(reference)
+                if (
+                    set(bundle["pre_snapshots"]) != set(nodes)
+                    or bundle["pre_state_hashes"] != pre_state_hashes
+                    or len(set(pre_state_hashes.values())) != 1
+                ):
+                    raise Refusal("Replication intent snapshot evidence diverges.", "EVIDENCE_INVALID")
+                intents[entry["sequence"]] = entry
+                continue
+            if record_type in {
+                "replicated_chat_commit",
+                "replicated_chat_failure",
+                "replicated_chat_recovery",
+            }:
                 if "pre_snapshots" in record:
                     raise Refusal("Terminal evidence duplicates private snapshots.", "EVIDENCE_INVALID")
                 intent = by_sequence.get(record.get("intent_sequence"))
@@ -251,10 +316,14 @@ class EvidenceLedger:
                     intent is None
                     or intent["event_hash"] != record.get("intent_event_hash")
                     or intent["record"].get("type") != "replicated_chat_intent"
-                    or intent["record"].get("snapshot_bundle_path")
-                    != record.get("snapshot_bundle", {}).get("path")
+                    or entry["sequence"] != intent["record"].get("terminal_sequence")
+                    or intent["record"].get("snapshot_bundle") != record.get("snapshot_bundle")
+                    or intent["record"].get("pre_state_hashes")
+                    != record.get("pre_state_hashes")
+                    or intent["record"].get("message") != record.get("message")
                 ):
                     raise Refusal("Terminal evidence intent link is invalid.", "EVIDENCE_INVALID")
+                terminals.setdefault(intent["sequence"], []).append(entry)
                 bundle = self.read_snapshot_bundle(record.get("snapshot_bundle"))
                 if bundle["pre_state_hashes"] != record.get("pre_state_hashes"):
                     raise Refusal("Terminal evidence pre-state hashes diverge.", "EVIDENCE_INVALID")
@@ -281,6 +350,107 @@ class EvidenceLedger:
                     "failures": [],
                 }:
                     raise Refusal("Commit restore evidence is invalid.", "EVIDENCE_INVALID")
+                if record_type == "replicated_chat_commit":
+                    state_hashes = record.get("state_hashes")
+                    results = record.get("results")
+                    if (
+                        record.get("converged") is not True
+                        or not isinstance(results, dict)
+                        or set(results) != set(intent["record"]["nodes"])
+                        or any(
+                            not isinstance(result, dict)
+                            or set(result) != {"response", "agent_logs", "session_id"}
+                            or result["session_id"] != intent["record"]["message"]["session_id"]
+                            for result in results.values()
+                        )
+                        or not isinstance(state_hashes, dict)
+                        or set(state_hashes) != set(intent["record"]["nodes"])
+                        or any(
+                            not isinstance(digest, str)
+                            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                            for digest in state_hashes.values()
+                        )
+                        or len(set(state_hashes.values())) != 1
+                    ):
+                        raise Refusal("Commit convergence evidence is invalid.", "EVIDENCE_INVALID")
+                elif record_type == "replicated_chat_recovery":
+                    expected_hashes = intent["record"]["pre_state_hashes"]
+                    if (
+                        restore
+                        != {
+                            "status": "verified",
+                            "state_hashes": expected_hashes,
+                            "failures": [],
+                        }
+                        or record.get("restored_state_hashes") != expected_hashes
+                        or record.get("rollback_verified") is not True
+                        or record.get("rollback_failures") != []
+                        or record.get("converged") is not True
+                        or len(set(expected_hashes.values())) != 1
+                    ):
+                        raise Refusal("Recovery terminal evidence is invalid.", "EVIDENCE_INVALID")
+                else:
+                    rollback_required = record.get("rollback_required")
+                    rollback_verified = record.get("rollback_verified")
+                    failure = record.get("failure")
+                    if (
+                        not isinstance(rollback_required, bool)
+                        or not isinstance(rollback_verified, bool)
+                        or not isinstance(failure, dict)
+                        or set(failure) != {"code", "message"}
+                        or any(not isinstance(value, str) for value in failure.values())
+                        or not isinstance(record.get("rollback_failures"), list)
+                        or not isinstance(record.get("restored_state_hashes"), dict)
+                    ):
+                        raise Refusal("Failure terminal evidence is invalid.", "EVIDENCE_INVALID")
+                    expected_restore = (
+                        "not_required"
+                        if not rollback_required
+                        else "verified"
+                        if rollback_verified
+                        else "failed"
+                    )
+                    expected_hashes = intent["record"]["pre_state_hashes"]
+                    if (
+                        restore["status"] != expected_restore
+                        or (
+                            rollback_required
+                            and rollback_verified
+                            and (
+                                record["restored_state_hashes"] != expected_hashes
+                                or restore["state_hashes"] != expected_hashes
+                                or record["rollback_failures"]
+                                or restore["failures"]
+                            )
+                        )
+                    ):
+                        raise Refusal("Failure restore evidence is invalid.", "EVIDENCE_INVALID")
+
+        for linked_sequence in terminals:
+            if linked_sequence not in intents:
+                raise Refusal("Terminal evidence is orphaned.", "EVIDENCE_INVALID")
+        unmatched: list[dict] = []
+        for sequence, intent in intents.items():
+            linked = terminals.get(sequence, [])
+            if len(linked) > 1:
+                raise Refusal("Replication intent has duplicate terminals.", "EVIDENCE_INVALID")
+            if not linked:
+                unmatched.append(intent)
+        if unmatched:
+            if (
+                not allow_unmatched
+                or len(unmatched) != 1
+                or unmatched[0]["sequence"] != len(entries)
+                or unmatched[0]["record"]["terminal_sequence"] != len(entries) + 1
+            ):
+                raise Refusal("Replication intent has no valid terminal.", "EVIDENCE_INVALID")
+        return entries, unmatched
+
+    def recovery_audit(self) -> tuple[list[dict], list[dict]]:
+        return self._audit_transactions(allow_unmatched=True)
+
+    def audit(self) -> list[dict]:
+        entries, _ = self._audit_transactions(allow_unmatched=False)
         return entries
 
     @contextmanager
@@ -504,6 +674,7 @@ class NodeProcess:
             if key in {"HOME", "PATH", "PYTHONPATH", "VIRTUAL_ENV", "SYSTEMROOT"}
         }
         environment["PYTHONUTF8"] = "1"
+        self._lock = threading.Lock()
         self._process = subprocess.Popen(
             [sys.executable, "-m", "rapp_virtual_as400.node_worker", "--root", str(self.root)],
             stdin=subprocess.PIPE,
@@ -513,7 +684,19 @@ class NodeProcess:
             encoding="utf-8",
             env=environment,
         )
-        self._lock = threading.Lock()
+        try:
+            ready = self.request(
+                {"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"}
+            )
+            if (
+                ready.get("protocol") != "RAPP/1"
+                or ready.get("control") != "snapshot"
+                or ready.get("status") != "ok"
+            ):
+                raise Refusal(f"Node {self.node_id} did not become ready.", "NODE_UNAVAILABLE")
+        except Exception:
+            self.close()
+            raise
 
     @property
     def pid(self) -> int:
@@ -567,12 +750,23 @@ class PrivateVNetNeighborhood:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
         self._root_lock = root_lock(self.root)
-        self.ledger = EvidenceLedger(
-            self.root / "evidence" / "events.jsonl",
-            transaction_lock=self._root_lock,
-        )
-        self.nodes = {node: NodeProcess(node, self.root / "nodes" / node) for node in ids}
         self._replication_lock = threading.RLock()
+        self._operable = False
+        self.nodes: dict[str, NodeProcess] = {}
+        try:
+            with self._root_lock:
+                self.ledger = EvidenceLedger(
+                    self.root / "evidence" / "events.jsonl",
+                    transaction_lock=self._root_lock,
+                )
+                self.nodes = {
+                    node: NodeProcess(node, self.root / "nodes" / node) for node in ids
+                }
+                self._recover_unmatched_intent()
+                self._operable = True
+        except BaseException:
+            self.close()
+            raise
 
     def __enter__(self) -> "PrivateVNetNeighborhood":
         return self
@@ -581,14 +775,90 @@ class PrivateVNetNeighborhood:
         self.close()
 
     def close(self) -> None:
+        self._operable = False
         for node in self.nodes.values():
             node.close()
+
+    def _ensure_operable(self) -> None:
+        if not self._operable:
+            raise Refusal(
+                "Neighborhood is closed pending proven durable recovery.",
+                "RECOVERY_REQUIRED",
+            )
+
+    def _recover_unmatched_intent(self) -> None:
+        entries, unmatched = self.ledger.recovery_audit()
+        for entry in entries:
+            record = entry["record"]
+            if (
+                record.get("type") == "replicated_chat_failure"
+                and record.get("restore", {}).get("status") == "failed"
+            ):
+                raise Refusal(
+                    "Evidence records an unverified rollback.",
+                    "RECOVERY_FAILED",
+                )
+        if not unmatched:
+            return
+        intent = unmatched[0]
+        record = intent["record"]
+        if set(record["nodes"]) != set(self.nodes):
+            raise Refusal(
+                "Recovery topology does not match the durable intent.",
+                "RECOVERY_FAILED",
+            )
+        bundle = self.ledger.read_snapshot_bundle(record["snapshot_bundle"])
+        snapshots = bundle["pre_snapshots"]
+        expected_hashes = bundle["pre_state_hashes"]
+        if (
+            set(snapshots) != set(self.nodes)
+            or expected_hashes != record["pre_state_hashes"]
+            or len(set(expected_hashes.values())) != 1
+        ):
+            raise Refusal(
+                "Recovery snapshot evidence cannot prove convergence.",
+                "RECOVERY_FAILED",
+            )
+        restored_hashes, failures = self._restore_and_verify(snapshots)
+        if failures or restored_hashes != expected_hashes or len(set(restored_hashes.values())) != 1:
+            raise Refusal(
+                "Durable intent recovery could not restore every node exactly.",
+                "RECOVERY_FAILED",
+            )
+        recovery_record = {
+            "type": "replicated_chat_recovery",
+            "intent_sequence": intent["sequence"],
+            "intent_event_hash": intent["event_hash"],
+            "message": record["message"],
+            "snapshot_bundle": record["snapshot_bundle"],
+            "pre_state_hashes": expected_hashes,
+            "restored_state_hashes": restored_hashes,
+            "rollback_verified": True,
+            "rollback_failures": [],
+            "restore": {
+                "status": "verified",
+                "state_hashes": restored_hashes,
+                "failures": [],
+            },
+            "converged": True,
+        }
+        try:
+            terminal = self.ledger.append(recovery_record)
+        except Exception as error:
+            raise Refusal(
+                f"Recovery terminal evidence append failed ({type(error).__name__}).",
+                "RECOVERY_FAILED",
+            ) from error
+        if terminal["sequence"] != record["terminal_sequence"]:
+            raise Refusal("Recovery did not use its reserved terminal slot.", "RECOVERY_FAILED")
+        self.ledger.audit()
 
     @staticmethod
     def _event_time(sequence: int) -> str:
         return (datetime(2000, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=sequence)).isoformat()
 
     def topology(self) -> dict:
+        self._ensure_operable()
         return {
             "schema": "rapp.private-vnet/v1",
             "provider": "provider-neutral",
@@ -619,6 +889,7 @@ class PrivateVNetNeighborhood:
         except KeyError:
             raise Refusal(f"Node {node_id} is not in this neighborhood.", "OBJECT_NOT_FOUND") from None
         with self._replication_lock, self._root_lock:
+            self._ensure_operable()
             return node.request(
                 {
                     "protocol": "RAPP/1",
@@ -711,7 +982,14 @@ class PrivateVNetNeighborhood:
         user_input = canonical_json_strings(user_input)  # type: ignore[assignment]
         session_id = canonical_json_strings(session_id)  # type: ignore[assignment]
         idempotency_key = canonical_json_strings(idempotency_key)  # type: ignore[assignment]
+        if (
+            not isinstance(user_input, str)
+            or not isinstance(session_id, str)
+            or (idempotency_key is not None and not isinstance(idempotency_key, str))
+        ):
+            raise Refusal("Replicated chat fields must be strings.", "INVALID_REQUEST")
         with self._replication_lock, self.ledger.reserve(2):
+            self._ensure_operable()
             sequence = self.ledger.next_sequence()
             event_at = self._event_time(sequence)
             key = idempotency_key or f"replicated-{sequence}"
@@ -729,6 +1007,11 @@ class PrivateVNetNeighborhood:
                 pre_state_hashes = {
                     node_id: _digest(state) for node_id, state in pre_snapshots.items()
                 }
+                if len(set(pre_state_hashes.values())) != 1:
+                    raise Refusal(
+                        "Replicated node pre-states diverged.",
+                        "REPLICATION_DIVERGED",
+                    )
                 bundle = {
                     "pre_snapshots": pre_snapshots,
                     "pre_state_hashes": pre_state_hashes,
@@ -762,6 +1045,9 @@ class PrivateVNetNeighborhood:
                         "message": message,
                         "nodes": list(self.nodes),
                         "snapshot_bundle_path": bundle_reference["path"],
+                        "snapshot_bundle": bundle_reference,
+                        "pre_state_hashes": pre_state_hashes,
+                        "terminal_sequence": sequence + 1,
                     }
                 )
             except Exception as error:
@@ -769,6 +1055,7 @@ class PrivateVNetNeighborhood:
                     f"Intent evidence append failed ({type(error).__name__}).",
                     "EVIDENCE_IO_FAILED",
                 ) from error
+            self._operable = False
             intent_link = {
                 "intent_sequence": intent["sequence"],
                 "intent_event_hash": intent["event_hash"],
@@ -805,6 +1092,7 @@ class PrivateVNetNeighborhood:
                             "converged": True,
                         }
                     )
+                    self._operable = True
                 except Exception as error:
                     raise Refusal(
                         f"Terminal evidence append failed ({type(error).__name__}).",
@@ -815,6 +1103,7 @@ class PrivateVNetNeighborhood:
                 rollback_failures: list[str] = []
                 if mutation_started and len(pre_snapshots) == len(self.nodes):
                     restored_hashes, rollback_failures = self._restore_and_verify(pre_snapshots)
+                terminal_recorded = False
                 try:
                     self.ledger.append(
                         {
@@ -841,13 +1130,21 @@ class PrivateVNetNeighborhood:
                             },
                         }
                     )
+                    terminal_recorded = True
                 except Exception:
-                    pass
+                    self._operable = False
                 if rollback_failures:
+                    self._operable = False
                     raise Refusal(
                         "Replicated chat rollback could not be verified for every node.",
                         "ROLLBACK_FAILED",
                     ) from error
+                if not terminal_recorded:
+                    raise Refusal(
+                        "Replicated chat is closed pending durable recovery.",
+                        "RECOVERY_REQUIRED",
+                    ) from error
+                self._operable = True
                 if isinstance(error, Refusal):
                     raise
                 raise Refusal(
@@ -871,6 +1168,7 @@ class PrivateVNetNeighborhood:
 
     def replay_and_verify(self, node_id: str) -> dict:
         with self._replication_lock, self._root_lock:
+            self._ensure_operable()
             if node_id not in self.nodes:
                 raise Refusal(f"Node {node_id} is not in this neighborhood.", "OBJECT_NOT_FOUND")
             entries = self.ledger.audit()
@@ -952,6 +1250,7 @@ class PrivateVNetNeighborhood:
             raise Refusal("Mode must be deterministic or stochastic.", "INVALID_REQUEST")
 
         with self._replication_lock, self.ledger.reserve(1, MAX_EVIDENCE_RECORD_BYTES):
+            self._ensure_operable()
             attempts: list[dict] = []
             node_items = list(self.nodes.items())
             for replica in range(replicas):

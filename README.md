@@ -20,7 +20,10 @@ credentials or production data. It is not production software.**
 - Strict allowlist parser. No shell, SQL, `eval`, filesystem commands,
   traversal, or outbound network feature exists.
 - Batch transactions roll back on refusal; exact decimals remain strings.
-- Idempotency, durable sessions, concurrency serialization, and bounded data.
+- Idempotency uses reversible canonical JSON tuple identities, so allowed
+  colons in session IDs and keys cannot alias; legacy cache entries migrate
+  deterministically from their bound response session or fail closed.
+- Durable sessions, concurrency serialization, and bounded data.
 - A provider-neutral private-vNet simulator runs isolated local node
   processes over typed parent/child pipes, without LAN or sibling routes.
 - A root-scoped POSIX/Windows interprocess lock serializes complete
@@ -28,6 +31,10 @@ credentials or production data. It is not production software.**
 - Byte-capped, hash-chained evidence keeps exact pre-state snapshots once in
   immutable private bundles; terminal records contain verified references,
   hashes, byte counts, and restore status rather than duplicate snapshots.
+- Opening a neighborhood under its root lock audits intent/terminal
+  cardinality and automatically restores every node for an unmatched durable
+  intent before accepting operations, then appends recovery evidence in the
+  terminal slot reserved by that intent.
 - Strict restore validation covers object grammar, schema/value limits,
   counters, revisions, and queue/job referential integrity before atomic
   replacement. Unexpected worker errors become stable refusals.
@@ -64,6 +71,8 @@ curl -s -X POST http://127.0.0.1:7084/chat \
 ```
 
 `user_input` is required. `session_id` and `idempotency_key` are optional.
+Their allowed strings may contain colons; the persisted cache identity is the
+canonical JSON tuple `[session_id,idempotency_key]`, never delimiter joining.
 Successful responses have exactly three top-level fields. Refused requests:
 
 ```json

@@ -17,6 +17,37 @@ from .support import EngineTestCase
 
 
 class NeighborhoodTests(EngineTestCase):
+    def _leave_unmatched_after_first_mutation(self, root) -> dict:
+        neighborhood = PrivateVNetNeighborhood(root)
+        first = neighborhood.nodes["AS400-A"]
+        original = first.request
+
+        def crash_after_mutation(message: dict) -> dict:
+            response = original(message)
+            if message.get("kind") == "chat":
+                raise SystemExit("simulated parent crash")
+            return response
+
+        first.request = crash_after_mutation  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(SystemExit, "simulated parent crash"):
+                neighborhood.replicate_chat(
+                    "CRTLIB LIB(CRASHED)",
+                    "crash",
+                    "first-node",
+                )
+            entries = neighborhood.ledger.read()
+            self.assertEqual(
+                [entry["record"]["type"] for entry in entries],
+                ["replicated_chat_intent"],
+            )
+            with self.assertRaises(Refusal) as blocked:
+                neighborhood.topology()
+            self.assertEqual(blocked.exception.code, "RECOVERY_REQUIRED")
+            return entries[0]
+        finally:
+            neighborhood.close()
+
     def test_two_isolated_nodes_replicate_replay_and_run_100_identical(self) -> None:
         with PrivateVNetNeighborhood(self.work / "vnet") as neighborhood:
             topology = neighborhood.topology()
@@ -221,6 +252,37 @@ class NeighborhoodTests(EngineTestCase):
             self.assertTrue(entries[1]["record"]["rollback_verified"])
             self.assertNotIn("pre_snapshots", entries[1]["record"])
             neighborhood.ledger.audit()
+
+    def test_unrecordable_terminal_closes_operations_until_reopen_recovery(self) -> None:
+        root = self.work / "unrecordable"
+        neighborhood = PrivateVNetNeighborhood(root)
+        original_append = neighborhood.ledger.append
+
+        def fail_all_terminals(record: dict) -> dict:
+            if record.get("type") in {
+                "replicated_chat_commit",
+                "replicated_chat_failure",
+            }:
+                raise OSError("injected terminal outage")
+            return original_append(record)
+
+        neighborhood.ledger.append = fail_all_terminals  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(Refusal, "closed pending durable recovery") as caught:
+                neighborhood.replicate_chat("CRTLIB LIB(CLOSED)", "closed", "closed")
+            self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+            with self.assertRaises(Refusal) as blocked:
+                neighborhood.chat("AS400-A", "DSPLIB", "blocked")
+            self.assertEqual(blocked.exception.code, "RECOVERY_REQUIRED")
+        finally:
+            neighborhood.close()
+
+        with PrivateVNetNeighborhood(root) as recovered:
+            self.assertEqual(
+                [entry["record"]["type"] for entry in recovered.ledger.audit()],
+                ["replicated_chat_intent", "replicated_chat_recovery"],
+            )
+            self.assertEqual(recovered._snapshots()["AS400-A"]["libraries"], {})
 
     def test_rollback_acknowledgement_hash_is_verified(self) -> None:
         with PrivateVNetNeighborhood(self.work / "vnet") as neighborhood:
@@ -480,6 +542,108 @@ class NeighborhoodTests(EngineTestCase):
         self.assertEqual(reopened.write_snapshot_bundle("intent-1.json", first), reference)
         self.assertEqual(reopened.read(), [])
         self.assertEqual(reopened.read_snapshot_bundle(reference), first)
+
+    def test_unmatched_intent_recovers_on_open_then_converges_and_replays(self) -> None:
+        root = self.work / "crash-recovery"
+        intent = self._leave_unmatched_after_first_mutation(root)
+        first_state = AtomicStore(root / "nodes" / "AS400-A" / "state.json").snapshot()
+        second_state = AtomicStore(root / "nodes" / "AS400-B" / "state.json").snapshot()
+        self.assertIn("CRASHED", first_state["libraries"])
+        self.assertNotIn("CRASHED", second_state["libraries"])
+
+        with PrivateVNetNeighborhood(root) as recovered:
+            snapshots = recovered._snapshots()
+            self.assertEqual(snapshots["AS400-A"], snapshots["AS400-B"])
+            self.assertEqual(snapshots["AS400-A"]["libraries"], {})
+            entries = recovered.ledger.audit()
+            self.assertEqual(
+                [entry["record"]["type"] for entry in entries],
+                ["replicated_chat_intent", "replicated_chat_recovery"],
+            )
+            terminal = entries[1]
+            self.assertEqual(terminal["sequence"], intent["record"]["terminal_sequence"])
+            self.assertEqual(terminal["record"]["intent_event_hash"], intent["event_hash"])
+            self.assertTrue(terminal["record"]["rollback_verified"])
+
+            receipt = recovered.replicate_chat(
+                "CRTLIB LIB(CRASHED)",
+                "crash",
+                "first-node",
+            )
+            self.assertTrue(receipt["converged"])
+            replay = recovered.replay_and_verify("AS400-B")
+            self.assertEqual(replay["events_replayed"], 1)
+            self.assertTrue(replay["converged"])
+
+    def test_unmatched_intent_missing_or_tampered_bundle_fails_open_closed(self) -> None:
+        for damage in ("missing", "tampered"):
+            with self.subTest(damage=damage):
+                root = self.work / f"recovery-{damage}"
+                intent = self._leave_unmatched_after_first_mutation(root)
+                bundle_path = root / "evidence" / intent["record"]["snapshot_bundle"]["path"]
+                if damage == "missing":
+                    bundle_path.unlink()
+                else:
+                    encoded = bundle_path.read_bytes()
+                    bundle_path.write_bytes(bytes([encoded[0] ^ 1]) + encoded[1:])
+                with self.assertRaisesRegex(Refusal, "Snapshot bundle"):
+                    PrivateVNetNeighborhood(root)
+                ledger = neighborhood_module.EvidenceLedger(root / "evidence" / "events.jsonl")
+                self.assertEqual(
+                    [entry["record"]["type"] for entry in ledger.read()],
+                    ["replicated_chat_intent"],
+                )
+
+    def test_unmatched_intent_terminal_capacity_failure_fails_closed_and_retries(self) -> None:
+        root = self.work / "recovery-capacity"
+        self._leave_unmatched_after_first_mutation(root)
+        with mock.patch.object(neighborhood_module, "MAX_EVIDENCE_EVENTS", 1):
+            with self.assertRaisesRegex(Refusal, "Recovery terminal evidence append failed"):
+                PrivateVNetNeighborhood(root)
+        ledger = neighborhood_module.EvidenceLedger(root / "evidence" / "events.jsonl")
+        self.assertEqual(len(ledger.read()), 1)
+        with PrivateVNetNeighborhood(root) as recovered:
+            self.assertEqual(
+                [entry["record"]["type"] for entry in recovered.ledger.audit()],
+                ["replicated_chat_intent", "replicated_chat_recovery"],
+            )
+
+    def test_audit_rejects_orphan_mismatched_and_duplicate_terminals(self) -> None:
+        orphan = neighborhood_module.EvidenceLedger(
+            self.work / "orphan" / "evidence" / "events.jsonl"
+        )
+        orphan.append(
+            {
+                "type": "replicated_chat_commit",
+                "intent_sequence": 99,
+                "intent_event_hash": "0" * 64,
+            }
+        )
+        with self.assertRaisesRegex(Refusal, "intent link"):
+            orphan.audit()
+
+        mismatch_root = self.work / "mismatched"
+        intent = self._leave_unmatched_after_first_mutation(mismatch_root)
+        mismatch = neighborhood_module.EvidenceLedger(
+            mismatch_root / "evidence" / "events.jsonl"
+        )
+        mismatch.append(
+            {
+                "type": "replicated_chat_recovery",
+                "intent_sequence": intent["sequence"],
+                "intent_event_hash": "0" * 64,
+            }
+        )
+        with self.assertRaisesRegex(Refusal, "intent link"):
+            mismatch.audit()
+
+        duplicate_root = self.work / "duplicate"
+        with PrivateVNetNeighborhood(duplicate_root) as neighborhood:
+            neighborhood.replicate_chat("CRTLIB LIB(ONE)", "one", "one")
+            duplicate_record = copy.deepcopy(neighborhood.ledger.read()[-1]["record"])
+            neighborhood.ledger.append(duplicate_record)
+            with self.assertRaisesRegex(Refusal, "intent link"):
+                neighborhood.ledger.audit()
 
     def test_directory_durability_precedes_intent_append(self) -> None:
         with PrivateVNetNeighborhood(self.work / "ordering") as neighborhood:

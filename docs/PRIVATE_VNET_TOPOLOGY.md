@@ -39,24 +39,38 @@ node chat, replay/reset, and replicated-run evidence use the same authority,
 so one instance cannot append a duplicate sequence or roll back another
 instance's completed write.
 
-`PrivateVNetNeighborhood.replicate_chat()` reserves two event slots and
-durably appends an intent before contacting any node. It then captures and
-validates each exact pre-event snapshot and preflights the remaining maximum
-terminal record + bundle byte budget before mutation. It writes the snapshots
-exactly once as an immutable `0600` JSON bundle before sending the same typed
-RAPP/1 chat event, idempotency key, and deterministic event timestamp to every
-node. A linked commit is appended only when response hashes and complete
-persisted-state hashes agree.
+`PrivateVNetNeighborhood.replicate_chat()` reserves adjacent intent and
+terminal event slots and durably appends an intent before contacting any node.
+The intent binds its terminal sequence, complete immutable bundle reference
+(relative path, SHA-256, and byte count), named nodes, message, and pre-state
+hashes. It captures and validates each exact converged pre-event snapshot and
+preflights the remaining maximum terminal record + bundle byte budget before
+mutation. It writes the snapshots exactly once as an immutable `0600` JSON
+bundle before sending the same typed RAPP/1 chat event, idempotency key, and
+deterministic event timestamp to every node. A linked commit is appended only
+when response hashes and complete persisted-state hashes agree.
 
 Any node failure, result/state divergence, or terminal evidence failure
 restores every node through the bounded restore control and verifies each
 restored hash against its exact pre-event snapshot. A linked failure/rollback
-record is appended when evidence I/O permits; an unpaired durable intent makes
-terminal evidence I/O failure visible. Restore snapshots use strict schema,
-type/value/limit, object-name, counter/revision, queue/job referential, depth,
-and size validation before atomic private writes. Unexpected engine failures
-are returned as stable `WORKER_ERROR` refusals without turning failures into
-successes.
+record is appended when evidence I/O permits. If no terminal can be recorded,
+that live neighborhood fails operations closed.
+
+On every later open, before operations are accepted and while holding the root
+interprocess lock, the full ledger and bundle accounting are validated. One
+trailing unmatched intent is recoverable: its bound bundle path, digest, size,
+node set, snapshots, and converged pre-state hashes are validated; every named
+node is restored exactly and resnapshotted; then a linked
+`replicated_chat_recovery` terminal is durably appended in the intent's
+reserved slot. Missing/tampered evidence, topology mismatch, failed restore,
+or unavailable terminal capacity fails initialization closed. Full audit
+requires exactly one valid adjacent commit, failure, or recovery terminal for
+every intent and rejects orphan, duplicate, or mismatched terminals.
+
+Restore snapshots use strict schema, type/value/limit, object-name,
+counter/revision, queue/job referential, depth, and size validation before
+atomic private writes. Unexpected engine failures are returned as stable
+`WORKER_ERROR` refusals without turning failures into successes.
 
 Terminal records do not duplicate snapshots. They retain only an immutable
 relative bundle reference, SHA-256, byte count, pre-state hashes, and restore
@@ -68,9 +82,9 @@ capacity failure occurs before mutation.
 
 `replay_and_verify()` resets one selected node through its fixed typed control
 operation, verifies the complete evidence hash chain and referenced bundles,
-replays committed chat events only, ignores intents/failures, and requires
-byte-canonical state convergence with its peers. A failed replay restores the
-selected node's exact pre-replay state.
+replays committed chat events only, ignores intents/failures/recoveries, and
+requires byte-canonical state convergence with its peers. A failed replay
+restores the selected node's exact pre-replay state.
 
 Normal appends refresh sequence and hash from one bounded tail read instead of
 parsing all historical JSONL. Full `read()`/`audit()` still validates every

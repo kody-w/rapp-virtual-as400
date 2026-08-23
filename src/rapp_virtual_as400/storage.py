@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - POSIX
 MAX_RESTORE_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_SNAPSHOT_DEPTH = 32
 MAX_SIX_DIGIT_ID = 999_999
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[Path, "PortableRootLock"] = {}
 
@@ -122,6 +123,33 @@ def empty_state() -> dict:
     }
 
 
+def encode_idempotency_identity(session_id: str, idempotency_key: str) -> str:
+    """Return the canonical, reversible JSON tuple used as a cache mapping key."""
+    return json.dumps(
+        [session_id, idempotency_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def decode_idempotency_identity(value: object) -> tuple[str, str]:
+    if not isinstance(value, str):
+        raise Refusal("Idempotency cache identity is invalid.", "INVALID_SNAPSHOT")
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, UnicodeError):
+        raise Refusal("Idempotency cache identity is invalid.", "INVALID_SNAPSHOT") from None
+    if (
+        not isinstance(decoded, list)
+        or len(decoded) != 2
+        or any(not isinstance(item, str) for item in decoded)
+        or any(SESSION_ID_RE.fullmatch(item) is None for item in decoded)
+        or encode_idempotency_identity(decoded[0], decoded[1]) != value
+    ):
+        raise Refusal("Idempotency cache identity is invalid.", "INVALID_SNAPSHOT")
+    return decoded[0], decoded[1]
+
+
 class AtomicStore:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -135,6 +163,11 @@ class AtomicStore:
         with root_lock(self.path.parent):
             if not self.path.exists():
                 self._write(empty_state())
+            else:
+                persisted = self._read()
+                validated = self.validate_snapshot(persisted)
+                if validated != persisted:
+                    self._write(validated)
 
     def _read(self) -> dict:
         with self.path.open("r", encoding="utf-8") as handle:
@@ -180,6 +213,7 @@ class AtomicStore:
         }
         if not isinstance(snapshot, dict) or set(snapshot) != expected:
             raise Refusal("Restore snapshot has an invalid schema.", "INVALID_SNAPSHOT")
+        snapshot = copy.deepcopy(snapshot)
         integer_fields = ("revision", "next_job", "next_spool")
         if (
             not isinstance(snapshot["format"], int)
@@ -432,9 +466,8 @@ class AtomicStore:
         if snapshot["next_spool"] != max_spool + 1:
             invalid("Restore snapshot has an incoherent next-spool counter.")
 
-        session_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
         for session_id, session in snapshot["sessions"].items():
-            if not isinstance(session_id, str) or session_pattern.fullmatch(session_id) is None:
+            if not isinstance(session_id, str) or SESSION_ID_RE.fullmatch(session_id) is None:
                 invalid("Restore snapshot has an invalid session identifier.")
             if not exact_mapping(session, {"turns"}) or not isinstance(session["turns"], list):
                 invalid("Restore snapshot has an invalid session.")
@@ -454,6 +487,7 @@ class AtomicStore:
                     parse_batch(turn["input"])
                 except Refusal:
                     invalid("Restore snapshot has an invalid session input.")
+        migrated_idempotency: dict[str, dict] = {}
         for cache_key, cached in snapshot["idempotency"].items():
             if (
                 not isinstance(cache_key, str)
@@ -467,14 +501,32 @@ class AtomicStore:
             ):
                 invalid("Restore snapshot has invalid idempotency evidence.")
             result_session = cached["result"]["session_id"]
-            prefix = f"{result_session}:"
             if (
-                session_pattern.fullmatch(result_session) is None
-                or not cache_key.startswith(prefix)
-                or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", cache_key[len(prefix) :]) is None
+                SESSION_ID_RE.fullmatch(result_session) is None
                 or len(cached["result"]["agent_logs"]) > 16
             ):
                 invalid("Restore snapshot has invalid idempotency evidence.")
+            if cache_key.startswith("["):
+                try:
+                    identity_session, identity_key = decode_idempotency_identity(cache_key)
+                except Refusal:
+                    invalid("Restore snapshot has invalid idempotency evidence.")
+            else:
+                prefix = f"{result_session}:"
+                if (
+                    not cache_key.startswith(prefix)
+                    or SESSION_ID_RE.fullmatch(cache_key[len(prefix) :]) is None
+                ):
+                    invalid("Restore snapshot has ambiguous legacy idempotency evidence.")
+                identity_session = result_session
+                identity_key = cache_key[len(prefix) :]
+            if identity_session != result_session:
+                invalid("Restore snapshot idempotency session identity diverges.")
+            canonical_key = encode_idempotency_identity(identity_session, identity_key)
+            existing = migrated_idempotency.get(canonical_key)
+            if existing is not None and existing != cached:
+                invalid("Restore snapshot has conflicting idempotency evidence.")
+            migrated_idempotency[canonical_key] = cached
             for log in cached["result"]["agent_logs"]:
                 if not exact_mapping(log, {"command", "status"}) or any(
                     not isinstance(value, str) for value in log.values()
@@ -482,6 +534,7 @@ class AtomicStore:
                     invalid("Restore snapshot has invalid agent logs.")
                 if log["command"] not in engine_module.ALLOWED_CLAUSES or log["status"] != "ok":
                     invalid("Restore snapshot has invalid agent logs.")
+        snapshot["idempotency"] = migrated_idempotency
 
         if snapshot["revision"] == 0 and any(
             snapshot[field]

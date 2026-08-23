@@ -30,15 +30,24 @@ and is not used for inter-node traffic.
 
 ## Replication and evidence
 
-`PrivateVNetNeighborhood.replicate_chat()` sends the same typed RAPP/1 chat
-event, idempotency key, and deterministic event timestamp to every node. It
-accepts the event only when response hashes and complete persisted-state
-hashes agree. Every attempt and state hash is added to private, append-only,
-hash-chained JSONL evidence.
+`PrivateVNetNeighborhood.replicate_chat()` first reserves evidence capacity
+and durably appends an intent before contacting a node. It then captures each
+exact pre-event snapshot and hash before sending the same typed RAPP/1 chat
+event, idempotency key, and deterministic event timestamp to every node. A
+linked commit is appended only when response hashes and complete
+persisted-state hashes agree.
+
+Any node failure, result/state divergence, or terminal evidence failure
+restores every node through the bounded restore control and verifies each
+restored hash against its exact pre-event snapshot. A linked failure/rollback
+record is appended when evidence I/O permits; an unpaired durable intent makes
+terminal evidence I/O failure visible. Restore snapshots use strict schema,
+depth, and size validation and atomic private writes.
 
 `replay_and_verify()` resets one selected node through its fixed typed control
-operation, replays accepted chat events, and requires byte-canonical state
-convergence with its peers.
+operation, verifies the evidence hash chain, replays committed chat events
+only, ignores intents/failures, and requires byte-canonical state convergence
+with its peers.
 
 `run_replicated_job()` runs 1–100 bounded simulations across the node
 processes:

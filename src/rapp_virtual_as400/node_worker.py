@@ -10,8 +10,10 @@ from pathlib import Path
 
 from .engine import VirtualAS400
 from .errors import Refusal
+from .storage import MAX_RESTORE_SNAPSHOT_BYTES
 
 MAX_WORKER_MESSAGE_BYTES = 8192
+MAX_RESTORE_MESSAGE_BYTES = MAX_RESTORE_SNAPSHOT_BYTES + 1024
 
 
 def _canonical(value: object) -> bytes:
@@ -49,6 +51,11 @@ def _handle(engine: VirtualAS400, message: object) -> tuple[dict, bool]:
             raise Refusal("Reset control has unsupported fields.", "INVALID_REQUEST")
         engine.store.reset()
         return _control("reset"), False
+    if operation == "restore":
+        if set(message) != {"protocol", "kind", "operation", "state"}:
+            raise Refusal("Restore control has unsupported fields.", "INVALID_REQUEST")
+        engine.store.restore(message["state"])
+        return _control("restore", state_hash=hashlib.sha256(_canonical(engine.store.snapshot())).hexdigest()), False
     if operation == "simulate":
         allowed = {"protocol", "kind", "operation", "job", "replica", "mode", "expected"}
         if set(message) - allowed:
@@ -84,9 +91,17 @@ def main(argv: list[str] | None = None) -> int:
         stop = False
         session_id = ""
         try:
-            if len(line.encode("utf-8")) > MAX_WORKER_MESSAGE_BYTES:
-                raise Refusal("Worker message exceeds 8192 bytes.", "LIMIT_EXCEEDED")
+            message_size = len(line.encode("utf-8"))
+            if message_size > MAX_RESTORE_MESSAGE_BYTES:
+                raise Refusal("Worker message exceeds the bounded restore limit.", "LIMIT_EXCEEDED")
             message = json.loads(line)
+            is_restore = (
+                isinstance(message, dict)
+                and message.get("kind") == "control"
+                and message.get("operation") == "restore"
+            )
+            if message_size > MAX_WORKER_MESSAGE_BYTES and not is_restore:
+                raise Refusal("Worker message exceeds 8192 bytes.", "LIMIT_EXCEEDED")
             if isinstance(message, dict) and isinstance(message.get("session_id"), str):
                 session_id = message["session_id"]
             response, stop = _handle(engine, message)

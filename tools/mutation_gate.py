@@ -160,6 +160,82 @@ MUTATIONS = [
             "raise SystemExit(0 if len(ledger.read()) == 2 else 1)\n"
         ),
     ),
+    Mutation(
+        "replication-evidence-capacity",
+        "neighborhood.py",
+        "with self._replication_lock, self.ledger.reserve(2):",
+        "with self._replication_lock:",
+        (
+            "from pathlib import Path\n"
+            "import rapp_virtual_as400.neighborhood as m\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood, Refusal\n"
+            "m.MAX_EVIDENCE_EVENTS=1\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " for node in n.nodes.values():\n"
+            "  original=node.request\n"
+            "  def guarded(message, original=original):\n"
+            "   if message.get('operation')=='stop': return original(message)\n"
+            "   raise SystemExit(2)\n"
+            "  node.request=guarded\n"
+            " try: n.replicate_chat('CRTLIB LIB(FULL)','full','full')\n"
+            " except Refusal: raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "replication-durable-intent",
+        "neighborhood.py",
+        '"type": "replicated_chat_intent",',
+        '"type": "replicated_chat_missing",',
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " for node in n.nodes.values():\n"
+            "  original=node.request\n"
+            "  def guarded(message, original=original):\n"
+            "   if message.get('operation')=='stop': return original(message)\n"
+            "   entries=n.ledger.read()\n"
+            "   if not entries or entries[-1]['record']['type']!='replicated_chat_intent': raise SystemExit(2)\n"
+            "   return original(message)\n"
+            "  node.request=guarded\n"
+            " n.replicate_chat('CRTLIB LIB(INTENT)','intent','intent')\n"
+        ),
+    ),
+    Mutation(
+        "replication-rollback",
+        "neighborhood.py",
+        "restored_hashes, rollback_failures = self._restore_and_verify(pre_snapshots)",
+        "restored_hashes, rollback_failures = {}, []",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood, Refusal\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " before=n._snapshots()\n"
+            " second=n.nodes['AS400-B']; original=second.request; failed=[False]\n"
+            " def fail(message):\n"
+            "  if message.get('kind')=='chat' and not failed[0]: failed[0]=True; raise Refusal('injected','NODE_UNAVAILABLE')\n"
+            "  return original(message)\n"
+            " second.request=fail\n"
+            " try: n.replicate_chat('CRTLIB LIB(ROLLBACK)','rollback','rollback')\n"
+            " except Refusal: pass\n"
+            " raise SystemExit(0 if n._snapshots()==before else 1)\n"
+        ),
+    ),
+    Mutation(
+        "replay-commits-only",
+        "neighborhood.py",
+        'if record.get("type") == "replicated_chat_commit":',
+        'if record.get("type") == "replicated_chat_intent":',
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " n.replicate_chat('CRTLIB LIB(REPLAY)','replay','replay')\n"
+            " result=n.replay_and_verify('AS400-B')\n"
+            " raise SystemExit(0 if result['events_replayed']==1 else 1)\n"
+        ),
+    ),
 ]
 
 

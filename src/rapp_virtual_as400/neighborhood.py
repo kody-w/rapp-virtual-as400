@@ -9,17 +9,20 @@ import re
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from .errors import Refusal
+from .storage import AtomicStore, MAX_RESTORE_SNAPSHOT_BYTES
 from .unicode_safe import canonical_json_strings
 
 MAX_NODES = 8
 MAX_REPLICAS = 100
 MAX_JOB_BYTES = 2048
 MAX_EVIDENCE_EVENTS = 10_000
+MAX_RESTORE_MESSAGE_BYTES = MAX_RESTORE_SNAPSHOT_BYTES + 1024
 NODE_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,31}$")
 
 
@@ -44,10 +47,15 @@ class EvidenceLedger:
         self.path = path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         if not self.path.exists():
             descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         os.chmod(self.path, 0o600)
         entries = self.read()
         self._previous = entries[-1]["event_hash"] if entries else "0" * 64
@@ -71,23 +79,72 @@ class EvidenceLedger:
                 entries.append(entry)
         return entries
 
+    @contextmanager
+    def reserve(self, event_count: int) -> Iterator[None]:
+        if not isinstance(event_count, int) or isinstance(event_count, bool) or event_count < 1:
+            raise Refusal("Evidence reservation must be positive.", "INVALID_REQUEST")
+        with self._lock:
+            if len(self.read()) + event_count > MAX_EVIDENCE_EVENTS:
+                raise Refusal("Evidence event limit reached.", "LIMIT_EXCEEDED")
+            yield
+
     def append(self, record: dict) -> dict:
         with self._lock:
-            sequence = len(self.read()) + 1
+            entries = self.read()
+            sequence = len(entries) + 1
             if sequence > MAX_EVIDENCE_EVENTS:
                 raise Refusal("Evidence event limit reached.", "LIMIT_EXCEEDED")
-            unsigned = {"sequence": sequence, "previous_hash": self._previous, "record": record}
+            previous = entries[-1]["event_hash"] if entries else "0" * 64
+            unsigned = {"sequence": sequence, "previous_hash": previous, "record": record}
             entry = {**unsigned, "event_hash": _digest(unsigned)}
             descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND, 0o600)
+            original_size = os.fstat(descriptor).st_size
             try:
-                with os.fdopen(descriptor, "ab", closefd=True) as handle:
-                    handle.write(_json_bytes(entry) + b"\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                encoded = _json_bytes(entry) + b"\n"
+                written = os.write(descriptor, encoded)
+                if written != len(encoded):
+                    raise OSError("Evidence append was incomplete.")
+                os.fsync(descriptor)
+            except Exception:
+                try:
+                    os.ftruncate(descriptor, original_size)
+                    os.fsync(descriptor)
+                except OSError:
+                    pass
+                raise
             finally:
+                os.close(descriptor)
                 os.chmod(self.path, 0o600)
             self._previous = entry["event_hash"]
             return entry
+
+    def write_snapshot_bundle(self, filename: str, bundle: dict) -> str:
+        if not re.fullmatch(r"intent-[1-9][0-9]*\.json", filename):
+            raise Refusal("Snapshot evidence filename is invalid.", "INVALID_REQUEST")
+        directory = self.path.parent / "snapshots"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        destination = directory / filename
+        temporary = directory / f"{filename}.new"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            encoded = _json_bytes(bundle)
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+            os.chmod(destination, 0o600)
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return str(destination.relative_to(self.path.parent))
 
 
 class NodeProcess:
@@ -119,8 +176,10 @@ class NodeProcess:
 
     def request(self, message: dict) -> dict:
         encoded = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) > 8192:
-            raise Refusal("Node request exceeds 8192 bytes.", "LIMIT_EXCEEDED")
+        is_restore = message.get("kind") == "control" and message.get("operation") == "restore"
+        limit = MAX_RESTORE_MESSAGE_BYTES if is_restore else 8192
+        if len(encoded.encode("utf-8")) > limit:
+            raise Refusal("Node request exceeds its bounded message limit.", "LIMIT_EXCEEDED")
         with self._lock:
             if self._process.poll() is not None or not self._process.stdin or not self._process.stdout:
                 raise Refusal(f"Node {self.node_id} is not running.", "NODE_UNAVAILABLE")
@@ -164,6 +223,7 @@ class PrivateVNetNeighborhood:
         os.chmod(self.root, 0o700)
         self.ledger = EvidenceLedger(self.root / "evidence" / "events.jsonl")
         self.nodes = {node: NodeProcess(node, self.root / "nodes" / node) for node in ids}
+        self._replication_lock = threading.RLock()
 
     def __enter__(self) -> "PrivateVNetNeighborhood":
         return self
@@ -209,21 +269,89 @@ class PrivateVNetNeighborhood:
             node = self.nodes[node_id]
         except KeyError:
             raise Refusal(f"Node {node_id} is not in this neighborhood.", "OBJECT_NOT_FOUND") from None
-        return node.request(
-            {
-                "protocol": "RAPP/1",
-                "kind": "chat",
-                "user_input": user_input,
-                "session_id": session_id,
-                "idempotency_key": idempotency_key,
-            }
-        )
+        with self._replication_lock:
+            return node.request(
+                {
+                    "protocol": "RAPP/1",
+                    "kind": "chat",
+                    "user_input": user_input,
+                    "session_id": session_id,
+                    "idempotency_key": idempotency_key,
+                }
+            )
+
+    @staticmethod
+    def _checked_response(node_id: str, response: dict, control: str | None = None) -> dict:
+        error = response.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            code = error.get("code")
+            raise Refusal(
+                f"Node {node_id} failed: {message if isinstance(message, str) else 'unknown refusal'}.",
+                code if isinstance(code, str) else "NODE_FAILED",
+            )
+        if control is not None and (
+            response.get("protocol") != "RAPP/1"
+            or response.get("control") != control
+            or response.get("status") != "ok"
+        ):
+            raise Refusal(f"Node {node_id} returned an invalid {control} response.", "NODE_FAILED")
+        return response
 
     def _snapshots(self) -> dict[str, dict]:
-        return {
-            node_id: node.request({"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"})["state"]
-            for node_id, node in self.nodes.items()
-        }
+        snapshots: dict[str, dict] = {}
+        for node_id, node in self.nodes.items():
+            response = self._checked_response(
+                node_id,
+                node.request({"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"}),
+                "snapshot",
+            )
+            snapshots[node_id] = AtomicStore.validate_snapshot(response.get("state"))
+        return snapshots
+
+    def _restore_and_verify(self, snapshots: dict[str, dict]) -> tuple[dict[str, str], list[str]]:
+        expected_hashes = {node_id: _digest(state) for node_id, state in snapshots.items()}
+        failures: list[str] = []
+        for node_id, node in self.nodes.items():
+            try:
+                response = self._checked_response(
+                    node_id,
+                    node.request(
+                        {
+                            "protocol": "RAPP/1",
+                            "kind": "control",
+                            "operation": "restore",
+                            "state": snapshots[node_id],
+                        }
+                    ),
+                    "restore",
+                )
+                if response.get("state_hash") != expected_hashes[node_id]:
+                    failures.append(f"{node_id}: restore acknowledgement hash diverged")
+            except Exception as error:
+                failures.append(f"{node_id}: restore failed ({type(error).__name__})")
+
+        restored_hashes: dict[str, str] = {}
+        for node_id, node in self.nodes.items():
+            try:
+                response = self._checked_response(
+                    node_id,
+                    node.request({"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"}),
+                    "snapshot",
+                )
+                restored = AtomicStore.validate_snapshot(response.get("state"))
+                restored_hashes[node_id] = _digest(restored)
+                if restored != snapshots[node_id] or restored_hashes[node_id] != expected_hashes[node_id]:
+                    failures.append(f"{node_id}: restored snapshot hash diverged")
+            except Exception as error:
+                failures.append(f"{node_id}: restore verification failed ({type(error).__name__})")
+        return restored_hashes, failures
+
+    @staticmethod
+    def _failure_details(error: Exception) -> dict[str, str]:
+        if isinstance(error, Refusal):
+            return {"code": error.code, "message": error.message}
+        return {"code": "NODE_FAILED", "message": f"{type(error).__name__}: {error}"}
 
     def replicate_chat(
         self,
@@ -234,68 +362,156 @@ class PrivateVNetNeighborhood:
         user_input = canonical_json_strings(user_input)  # type: ignore[assignment]
         session_id = canonical_json_strings(session_id)  # type: ignore[assignment]
         idempotency_key = canonical_json_strings(idempotency_key)  # type: ignore[assignment]
-        sequence = len(self.ledger.read()) + 1
-        event_at = self._event_time(sequence)
-        key = idempotency_key or f"replicated-{sequence}"
-        message = {
-            "protocol": "RAPP/1",
-            "kind": "chat",
-            "user_input": user_input,
-            "session_id": session_id,
-            "idempotency_key": key,
-            "event_at": event_at,
-        }
-        results = {node_id: node.request(message) for node_id, node in self.nodes.items()}
-        if len({_digest(result) for result in results.values()}) != 1:
-            raise Refusal("Replicated chat results diverged.", "REPLICATION_DIVERGED")
-        snapshots = self._snapshots()
-        state_hashes = {node_id: _digest(state) for node_id, state in snapshots.items()}
-        if len(set(state_hashes.values())) != 1:
-            raise Refusal("Replicated node states diverged.", "REPLICATION_DIVERGED")
-        entry = self.ledger.append(
-            {
-                "type": "replicated_chat",
-                "message": message,
-                "results": results,
-                "state_hashes": state_hashes,
-                "converged": True,
+        with self._replication_lock, self.ledger.reserve(2):
+            sequence = len(self.ledger.read()) + 1
+            event_at = self._event_time(sequence)
+            key = idempotency_key or f"replicated-{sequence}"
+            message = {
+                "protocol": "RAPP/1",
+                "kind": "chat",
+                "user_input": user_input,
+                "session_id": session_id,
+                "idempotency_key": key,
+                "event_at": event_at,
             }
-        )
-        return {
-            "protocol": "RAPP/1",
-            "control": "replicate_chat",
-            "chat_result": next(iter(results.values())),
-            "nodes": list(self.nodes),
-            "converged": True,
-            "state_hash": next(iter(state_hashes.values())),
-            "evidence": {"sequence": entry["sequence"], "event_hash": entry["event_hash"]},
-        }
+            snapshot_file = f"intent-{sequence}.json"
+            intent = self.ledger.append(
+                {
+                    "type": "replicated_chat_intent",
+                    "message": message,
+                    "nodes": list(self.nodes),
+                    "pre_event_snapshot_file": f"snapshots/{snapshot_file}",
+                }
+            )
+            intent_link = {
+                "intent_sequence": intent["sequence"],
+                "intent_event_hash": intent["event_hash"],
+            }
+            pre_snapshots: dict[str, dict] = {}
+            pre_state_hashes: dict[str, str] = {}
+            mutation_started = False
+            try:
+                pre_snapshots = self._snapshots()
+                pre_state_hashes = {
+                    node_id: _digest(state) for node_id, state in pre_snapshots.items()
+                }
+                self.ledger.write_snapshot_bundle(
+                    snapshot_file,
+                    {
+                        **intent_link,
+                        "pre_snapshots": pre_snapshots,
+                        "pre_state_hashes": pre_state_hashes,
+                    },
+                )
+                results: dict[str, dict] = {}
+                mutation_started = True
+                for node_id, node in self.nodes.items():
+                    results[node_id] = self._checked_response(node_id, node.request(message))
+                if len({_digest(result) for result in results.values()}) != 1:
+                    raise Refusal("Replicated chat results diverged.", "REPLICATION_DIVERGED")
+                post_snapshots = self._snapshots()
+                state_hashes = {
+                    node_id: _digest(state) for node_id, state in post_snapshots.items()
+                }
+                if len(set(state_hashes.values())) != 1:
+                    raise Refusal("Replicated node states diverged.", "REPLICATION_DIVERGED")
+                try:
+                    entry = self.ledger.append(
+                        {
+                            "type": "replicated_chat_commit",
+                            **intent_link,
+                            "message": message,
+                            "pre_snapshots": pre_snapshots,
+                            "pre_state_hashes": pre_state_hashes,
+                            "results": results,
+                            "state_hashes": state_hashes,
+                            "converged": True,
+                        }
+                    )
+                except Exception as error:
+                    raise Refusal(
+                        f"Terminal evidence append failed ({type(error).__name__}).",
+                        "EVIDENCE_IO_FAILED",
+                    ) from error
+            except Exception as error:
+                restored_hashes: dict[str, str] = {}
+                rollback_failures: list[str] = []
+                if mutation_started and len(pre_snapshots) == len(self.nodes):
+                    restored_hashes, rollback_failures = self._restore_and_verify(pre_snapshots)
+                try:
+                    self.ledger.append(
+                        {
+                            "type": "replicated_chat_failure",
+                            **intent_link,
+                            "message": message,
+                            "failure": self._failure_details(error),
+                            "pre_snapshots": pre_snapshots,
+                            "pre_state_hashes": pre_state_hashes,
+                            "rollback_required": mutation_started,
+                            "restored_state_hashes": restored_hashes,
+                            "rollback_verified": not mutation_started or not rollback_failures,
+                            "rollback_failures": rollback_failures,
+                        }
+                    )
+                except Exception:
+                    pass
+                if rollback_failures:
+                    raise Refusal(
+                        "Replicated chat rollback could not be verified for every node.",
+                        "ROLLBACK_FAILED",
+                    ) from error
+                if isinstance(error, Refusal):
+                    raise
+                raise Refusal(
+                    f"Replicated chat failed ({type(error).__name__}).",
+                    "NODE_FAILED",
+                ) from error
+            return {
+                "protocol": "RAPP/1",
+                "control": "replicate_chat",
+                "chat_result": next(iter(results.values())),
+                "nodes": list(self.nodes),
+                "converged": True,
+                "state_hash": next(iter(state_hashes.values())),
+                "evidence": {
+                    "intent_sequence": intent["sequence"],
+                    "intent_event_hash": intent["event_hash"],
+                    "sequence": entry["sequence"],
+                    "event_hash": entry["event_hash"],
+                },
+            }
 
     def replay_and_verify(self, node_id: str) -> dict:
-        if node_id not in self.nodes:
-            raise Refusal(f"Node {node_id} is not in this neighborhood.", "OBJECT_NOT_FOUND")
-        node = self.nodes[node_id]
-        node.request({"protocol": "RAPP/1", "kind": "control", "operation": "reset"})
-        replayed = 0
-        for entry in self.ledger.read():
-            record = entry["record"]
-            if record["type"] == "replicated_chat":
-                result = node.request(record["message"])
-                expected = record["results"][node_id]
-                if result != expected:
-                    raise Refusal("Replay result diverged from append-only evidence.", "REPLAY_DIVERGED")
-                replayed += 1
-        state_hashes = {name: _digest(state) for name, state in self._snapshots().items()}
-        if len(set(state_hashes.values())) != 1:
-            raise Refusal("Replayed node did not converge.", "REPLAY_DIVERGED")
-        return {
-            "protocol": "RAPP/1",
-            "control": "replay",
-            "node_id": node_id,
-            "events_replayed": replayed,
-            "converged": True,
-            "state_hash": next(iter(state_hashes.values())),
-        }
+        with self._replication_lock:
+            if node_id not in self.nodes:
+                raise Refusal(f"Node {node_id} is not in this neighborhood.", "OBJECT_NOT_FOUND")
+            entries = self.ledger.read()
+            node = self.nodes[node_id]
+            self._checked_response(
+                node_id,
+                node.request({"protocol": "RAPP/1", "kind": "control", "operation": "reset"}),
+                "reset",
+            )
+            replayed = 0
+            for entry in entries:
+                record = entry["record"]
+                if record.get("type") == "replicated_chat_commit":
+                    result = self._checked_response(node_id, node.request(record["message"]))
+                    expected = record["results"][node_id]
+                    if result != expected:
+                        raise Refusal("Replay result diverged from append-only evidence.", "REPLAY_DIVERGED")
+                    replayed += 1
+            state_hashes = {name: _digest(state) for name, state in self._snapshots().items()}
+            if len(set(state_hashes.values())) != 1:
+                raise Refusal("Replayed node did not converge.", "REPLAY_DIVERGED")
+            return {
+                "protocol": "RAPP/1",
+                "control": "replay",
+                "node_id": node_id,
+                "events_replayed": replayed,
+                "converged": True,
+                "state_hash": next(iter(state_hashes.values())),
+            }
 
     def run_replicated_job(
         self,

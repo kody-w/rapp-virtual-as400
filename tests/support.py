@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import unittest
 from pathlib import Path
@@ -23,3 +24,9 @@ class EngineTestCase(unittest.TestCase):
             "CRTPF FILE(TEST/ITEMS) FIELDS(ID:CHAR(8),QTY:INT,PRICE:DECIMAL(10,2),NOTE:CHAR(32))",
             "bootstrap",
         )
+
+    def assert_private_mode(self, path: Path, expected: int) -> None:
+        if os.name == "nt":
+            self.assertTrue(path.exists())
+            return
+        self.assertEqual(path.stat().st_mode & 0o777, expected)

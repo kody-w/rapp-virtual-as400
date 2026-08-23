@@ -468,6 +468,20 @@ MUTATIONS = [
             "raise SystemExit(1)\n"
         ),
     ),
+    Mutation(
+        "windows-directory-open-fallback",
+        "storage.py",
+        '    if os.name == "nt":\n        return',
+        "    if False:\n        return",
+        (
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "import rapp_virtual_as400.storage as m\n"
+            "with mock.patch.object(m.os,'name','nt'), "
+            "mock.patch.object(m.os,'open',side_effect=AssertionError('directory opened')):\n"
+            " m.fsync_directory(Path('.'))\n"
+        ),
+    ),
 ]
 
 

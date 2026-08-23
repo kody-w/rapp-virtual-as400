@@ -16,6 +16,10 @@ credentials or production data. It is not production software.**
   `{response, agent_logs, session_id}`.
 - Typed `GET /health`; stable HTTP 422 refusal envelope.
 - Atomic JSON persistence in a private `0700` directory with `0600` files.
+  File contents are flushed before publication; POSIX also opens and flushes
+  the containing directory. Python cannot safely open directory handles on
+  Windows, so Windows deliberately stops after the file flush and atomic
+  replace/link rather than calling unsupported `os.open(directory)`.
 - Capability-token shutdown; no PID files or PID-signaling authority.
 - Strict allowlist parser. No shell, SQL, `eval`, filesystem commands,
   traversal, or outbound network feature exists.

@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .errors import Refusal
-from .storage import AtomicStore, MAX_RESTORE_SNAPSHOT_BYTES, PortableRootLock, root_lock
+from .storage import (
+    AtomicStore,
+    MAX_RESTORE_SNAPSHOT_BYTES,
+    PortableRootLock,
+    fsync_directory as _fsync_directory,
+    root_lock,
+)
 from .unicode_safe import canonical_json_strings
 
 MAX_NODES = 8
@@ -48,14 +54,6 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_json_bytes(value)).hexdigest()
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 class EvidenceLedger:
     """Private append-only, hash-chained JSON Lines evidence."""
 
@@ -67,9 +65,14 @@ class EvidenceLedger:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.path.parent, 0o700)
             self._bundle_bytes_path = self.path.parent / ".bundle-bytes"
+            directory_changed = False
             if not self.path.exists():
                 descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                os.close(descriptor)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                directory_changed = True
             os.chmod(self.path, 0o600)
             self._snapshots_path = self.path.parent / "snapshots"
             snapshots_created = not self._snapshots_path.exists()
@@ -77,7 +80,7 @@ class EvidenceLedger:
             if self._snapshots_path.is_symlink() or not self._snapshots_path.is_dir():
                 raise Refusal("Snapshot evidence directory is unsafe.", "EVIDENCE_INVALID")
             os.chmod(self._snapshots_path, 0o700)
-            if snapshots_created:
+            if snapshots_created or directory_changed:
                 _fsync_directory(self.path.parent)
             self._cleanup_stale_bundle_temps()
             self._write_bundle_bytes(self._scan_bundle_bytes())
@@ -195,6 +198,7 @@ class EvidenceLedger:
                 os.fsync(handle.fileno())
             os.replace(temporary, self._bundle_bytes_path)
             os.chmod(self._bundle_bytes_path, 0o600)
+            _fsync_directory(self.path.parent)
         finally:
             if temporary.exists():
                 temporary.unlink()

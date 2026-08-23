@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 from rapp_virtual_as400 import Refusal, VirtualAS400
 from rapp_virtual_as400.storage import AtomicStore, encode_idempotency_identity
@@ -105,10 +104,8 @@ class EngineTests(EngineTestCase):
             self.engine.chat("CRTLIB LIB(LEFT)", "a:b", "c")
 
     def test_private_file_modes(self) -> None:
-        mode = os.stat(self.work / "state.json").st_mode & 0o777
-        directory_mode = os.stat(self.work).st_mode & 0o777
-        self.assertEqual(mode, 0o600)
-        self.assertEqual(directory_mode, 0o700)
+        self.assert_private_mode(self.work / "state.json", 0o600)
+        self.assert_private_mode(self.work, 0o700)
 
     def test_data_queue_job_queue_and_spool_report(self) -> None:
         self.bootstrap()

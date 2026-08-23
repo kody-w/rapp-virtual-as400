@@ -39,6 +39,15 @@ node chat, replay/reset, and replicated-run evidence use the same authority,
 so one instance cannot append a duplicate sequence or roll back another
 instance's completed write.
 
+State, snapshot, bundle-accounting, and new-ledger publications share one
+directory-durability primitive. Every platform flushes file contents before
+atomic `os.replace` or no-clobber hard-link publication. POSIX then opens,
+flushes, and closes the containing directory, and propagates any failure.
+Python's Windows standard library cannot safely open a directory with
+`os.open`, so Windows explicitly skips only that final directory flush; it
+still propagates real file-flush, replace, and link errors. Root serialization
+continues to use the existing one-byte `msvcrt` lock on Windows.
+
 `PrivateVNetNeighborhood.replicate_chat()` reserves adjacent intent and
 terminal event slots and durably appends an intent before contacting any node.
 The intent binds its terminal sequence, complete immutable bundle reference

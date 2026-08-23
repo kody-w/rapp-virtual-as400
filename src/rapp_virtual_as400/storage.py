@@ -35,6 +35,23 @@ _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[Path, "PortableRootLock"] = {}
 
 
+def fsync_directory(path: Path) -> None:
+    """Persist directory entries where the platform exposes a safe primitive.
+
+    Python does not support opening directory handles with ``os.open`` on
+    Windows. File contents are still flushed before atomic publication there,
+    but the directory entry cannot be flushed with the standard library.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class PortableRootLock:
     """Reentrant thread/process file lock shared by every instance for one root."""
 
@@ -206,11 +223,7 @@ class AtomicStore:
             os.chmod(temp, 0o600)
             os.replace(temp, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.path.parent)
         finally:
             if temp.exists():
                 temp.unlink()

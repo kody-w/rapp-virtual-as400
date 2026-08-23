@@ -9,14 +9,27 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.11"
+    env:
+      PYTHONPATH: src
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: PYTHONPATH=src python -m unittest discover -v
-      - run: PYTHONPATH=src python tools/mutation_gate.py
+      - name: Run core tests and wheel install proof
+        run: python -m unittest discover -v
+      - name: Run mutation gate
+        if: runner.os == 'Linux'
+        run: python tools/mutation_gate.py

@@ -92,7 +92,7 @@ class NeighborhoodTests(EngineTestCase):
             self.assertEqual(len(neighborhood.ledger.read()), 3)
 
             evidence = self.work / "vnet" / "evidence" / "events.jsonl"
-            self.assertEqual(os.stat(evidence).st_mode & 0o777, 0o600)
+            self.assert_private_mode(evidence, 0o600)
 
     def test_stochastic_exact_quorum_is_predeclared_and_outliers_retained(self) -> None:
         with PrivateVNetNeighborhood(self.work / "vnet") as neighborhood:
@@ -165,7 +165,7 @@ class NeighborhoodTests(EngineTestCase):
                 failure["snapshot_bundle"]["sha256"],
                 hashlib.sha256(encoded).hexdigest(),
             )
-            self.assertEqual(os.stat(snapshot_file).st_mode & 0o777, 0o600)
+            self.assert_private_mode(snapshot_file, 0o600)
 
     def test_result_divergence_rolls_back_every_node(self) -> None:
         with PrivateVNetNeighborhood(self.work / "vnet") as neighborhood:
@@ -352,8 +352,8 @@ class NeighborhoodTests(EngineTestCase):
         changed["revision"] = 7
         store.restore(changed)
         self.assertEqual(store.snapshot(), changed)
-        self.assertEqual(os.stat(store.path).st_mode & 0o777, 0o600)
-        self.assertEqual(os.stat(store.lock_path).st_mode & 0o777, 0o600)
+        self.assert_private_mode(store.path, 0o600)
+        self.assert_private_mode(store.lock_path, 0o600)
 
         with PrivateVNetNeighborhood(self.work / "vnet") as neighborhood:
             node = neighborhood.nodes["AS400-A"]
@@ -368,12 +368,12 @@ class NeighborhoodTests(EngineTestCase):
             self.assertEqual(response["error"]["code"], "INVALID_SNAPSHOT")
             neighborhood.replicate_chat("CRTLIB LIB(PRIVATE)", "private", "private")
             snapshots = neighborhood.ledger.path.parent / "snapshots"
-            self.assertEqual(os.stat(snapshots).st_mode & 0o777, 0o700)
-            self.assertEqual(os.stat(next(snapshots.iterdir())).st_mode & 0o777, 0o600)
+            self.assert_private_mode(snapshots, 0o700)
+            self.assert_private_mode(next(snapshots.iterdir()), 0o600)
             for child in neighborhood.nodes.values():
-                self.assertEqual(os.stat(child.root).st_mode & 0o777, 0o700)
-                self.assertEqual(os.stat(child.root / "state.json").st_mode & 0o777, 0o600)
-                self.assertEqual(os.stat(child.root / "state.json.lock").st_mode & 0o777, 0o600)
+                self.assert_private_mode(child.root, 0o700)
+                self.assert_private_mode(child.root / "state.json", 0o600)
+                self.assert_private_mode(child.root / "state.json.lock", 0o600)
 
     def test_two_instances_serialize_complete_replication_transactions(self) -> None:
         root = self.work / "shared"

@@ -534,7 +534,7 @@ class EvidenceLedger:
         if not synchronized:
             descriptor = -1
             try:
-                descriptor = os.open(self.path, os.O_RDONLY)
+                descriptor = os.open(self.path, os.O_RDWR)
                 os.fsync(descriptor)
                 synchronized = True
             except OSError:

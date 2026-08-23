@@ -21,6 +21,33 @@ from .support import EngineTestCase
 
 
 class NeighborhoodTests(EngineTestCase):
+    def _replay_protected_artifacts(self, neighborhood) -> tuple[dict, dict, dict]:
+        snapshots = neighborhood._snapshots()
+        node_files = {
+            node_id: {
+                child.name: child.read_bytes()
+                for child in sorted(node.root.iterdir(), key=lambda item: item.name)
+            }
+            for node_id, node in neighborhood.nodes.items()
+        }
+        evidence_files = {
+            child.relative_to(neighborhood.ledger.path.parent).as_posix(): child.read_bytes()
+            for child in sorted(
+                (
+                    path
+                    for path in neighborhood.ledger.path.parent.rglob("*")
+                    if path.is_file()
+                ),
+                key=lambda item: item.as_posix(),
+            )
+        }
+        return snapshots, node_files, evidence_files
+
+    def _assert_replay_protected_artifacts(self, neighborhood, expected) -> None:
+        self.assertEqual(self._replay_protected_artifacts(neighborhood), expected)
+        self.assertFalse(any(child.name.startswith(".replay-") for child in neighborhood.root.iterdir()))
+        self.assertEqual(neighborhood.topology()["node_count"], len(neighborhood.nodes))
+
     def _leave_unmatched_after_first_mutation(self, root) -> dict:
         neighborhood = PrivateVNetNeighborhood(root)
         first = neighborhood.nodes["AS400-A"]
@@ -339,6 +366,159 @@ class NeighborhoodTests(EngineTestCase):
             replay = neighborhood.replay_and_verify("AS400-B")
             self.assertEqual(replay["events_replayed"], 1)
             self.assertTrue(replay["converged"])
+
+    def test_replay_uses_disposable_node_from_recorded_initial_state(self) -> None:
+        root = self.work / "preloaded"
+        seeded = empty_state()
+        seeded["revision"] = 1
+        seeded["libraries"]["SEED"] = {"files": {}}
+        for node_id in ("AS400-A", "AS400-B"):
+            AtomicStore(root / "nodes" / node_id / "state.json").restore(seeded)
+        with PrivateVNetNeighborhood(root) as neighborhood:
+            neighborhood.replicate_chat(
+                "CRTPF FILE(SEED/ITEMS) FIELDS(ID:INT)",
+                "seeded",
+                "create-items",
+            )
+            before = self._replay_protected_artifacts(neighborhood)
+            replay = neighborhood.replay_and_verify("AS400-B")
+            self.assertEqual(replay["events_replayed"], 1)
+            self.assertEqual(replay["state_hash"], neighborhood.ledger.audit()[-1]["record"]["state_hashes"]["AS400-B"])
+            self._assert_replay_protected_artifacts(neighborhood, before)
+
+    def test_replay_mid_event_failure_never_touches_live_nodes_or_evidence(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "mid-event") as neighborhood:
+            neighborhood.replicate_chat("CRTLIB LIB(ONE)", "replay", "one")
+            neighborhood.replicate_chat("CRTLIB LIB(TWO)", "replay", "two")
+            before = self._replay_protected_artifacts(neighborhood)
+            original = neighborhood_module.NodeProcess.request
+            replay_events = 0
+
+            def fail_second_replay_event(node, message):
+                nonlocal replay_events
+                if node.node_id.startswith("REPLAY-") and message.get("kind") == "chat":
+                    replay_events += 1
+                    if replay_events == 2:
+                        raise Refusal("injected disposable event failure", "NODE_UNAVAILABLE")
+                return original(node, message)
+
+            with mock.patch.object(
+                neighborhood_module.NodeProcess,
+                "request",
+                fail_second_replay_event,
+            ):
+                with self.assertRaisesRegex(Refusal, "injected disposable event failure"):
+                    neighborhood.replay_and_verify("AS400-B")
+            self._assert_replay_protected_artifacts(neighborhood, before)
+
+    def test_replay_disposable_restore_close_and_cleanup_faults_preserve_live_state(self) -> None:
+        stages = ("restore", "close", "cleanup")
+        for stage in stages:
+            with self.subTest(stage=stage):
+                with PrivateVNetNeighborhood(self.work / f"replay-{stage}") as neighborhood:
+                    neighborhood.replicate_chat("CRTLIB LIB(SAFE)", "replay", stage)
+                    before = self._replay_protected_artifacts(neighborhood)
+                    original_request = neighborhood_module.NodeProcess.request
+                    original_close = neighborhood_module.NodeProcess.close
+                    original_erase = neighborhood._erase_disposable_replay_root
+
+                    def fault_restore(node, message):
+                        if (
+                            node.node_id.startswith("REPLAY-")
+                            and message.get("operation") == "restore"
+                        ):
+                            raise Refusal("injected disposable restore failure", "NODE_UNAVAILABLE")
+                        return original_request(node, message)
+
+                    def close_then_fault(node):
+                        original_close(node)
+                        if node.node_id.startswith("REPLAY-"):
+                            raise OSError("injected disposable close failure")
+
+                    def fault_erase(path):
+                        raise OSError("injected disposable cleanup failure")
+
+                    request_patch = (
+                        mock.patch.object(neighborhood_module.NodeProcess, "request", fault_restore)
+                        if stage == "restore"
+                        else mock.patch.object(neighborhood_module.NodeProcess, "request", original_request)
+                    )
+                    close_patch = (
+                        mock.patch.object(neighborhood_module.NodeProcess, "close", close_then_fault)
+                        if stage == "close"
+                        else mock.patch.object(neighborhood_module.NodeProcess, "close", original_close)
+                    )
+                    erase_patch = (
+                        mock.patch.object(neighborhood, "_erase_disposable_replay_root", fault_erase)
+                        if stage == "cleanup"
+                        else mock.patch.object(
+                            neighborhood,
+                            "_erase_disposable_replay_root",
+                            original_erase,
+                        )
+                    )
+                    with request_patch, close_patch, erase_patch:
+                        with self.assertRaises(Refusal):
+                            neighborhood.replay_and_verify("AS400-A")
+                    if stage == "cleanup":
+                        self.assertEqual(self._replay_protected_artifacts(neighborhood), before)
+                        stale = [
+                            child
+                            for child in neighborhood.root.iterdir()
+                            if child.name.startswith(".replay-")
+                        ]
+                        self.assertEqual(len(stale), 1)
+                        self.assertLessEqual(
+                            len(list(stale[0].iterdir())),
+                            neighborhood_module.MAX_REPLAY_ROOT_ENTRIES,
+                        )
+                        with self.assertRaisesRegex(Refusal, "not proven erased"):
+                            neighborhood.replay_and_verify("AS400-A")
+                        self.assertEqual(neighborhood.topology()["node_count"], 2)
+                        original_erase(stale[0])
+                    self._assert_replay_protected_artifacts(neighborhood, before)
+
+    def test_replay_uncertain_disposable_setup_fails_closed_without_live_change(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "replay-setup") as neighborhood:
+            neighborhood.replicate_chat("CRTLIB LIB(SAFE)", "replay", "setup")
+            before = self._replay_protected_artifacts(neighborhood)
+            with mock.patch.object(
+                neighborhood_module.NodeProcess,
+                "__init__",
+                side_effect=OSError("injected constructor failure"),
+            ):
+                with self.assertRaisesRegex(Refusal, "setup status was not proven"):
+                    neighborhood.replay_and_verify("AS400-A")
+            self.assertEqual(self._replay_protected_artifacts(neighborhood), before)
+            stale = [
+                child
+                for child in neighborhood.root.iterdir()
+                if child.name.startswith(".replay-")
+            ]
+            self.assertEqual(len(stale), 1)
+            self.assertEqual(list(stale[0].iterdir()), [])
+            with self.assertRaisesRegex(Refusal, "not proven erased"):
+                neighborhood.replay_and_verify("AS400-A")
+            self.assertEqual(neighborhood.topology()["node_count"], 2)
+            neighborhood._erase_disposable_replay_root(stale[0])
+            self._assert_replay_protected_artifacts(neighborhood, before)
+
+    def test_replay_tampered_evidence_fails_before_disposable_setup(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "tampered-replay") as neighborhood:
+            neighborhood.replicate_chat("CRTLIB LIB(SAFE)", "tamper", "tamper")
+            reference = neighborhood.ledger.read()[-1]["record"]["snapshot_bundle"]
+            bundle = neighborhood.ledger.path.parent / reference["path"]
+            encoded = bundle.read_bytes()
+            bundle.write_bytes(bytes([encoded[0] ^ 1]) + encoded[1:])
+            before = self._replay_protected_artifacts(neighborhood)
+            with mock.patch.object(
+                neighborhood,
+                "_create_disposable_replay_root",
+                side_effect=AssertionError("disposable setup must not start"),
+            ):
+                with self.assertRaisesRegex(Refusal, "digest"):
+                    neighborhood.replay_and_verify("AS400-B")
+            self._assert_replay_protected_artifacts(neighborhood, before)
 
     def test_restore_is_strict_atomic_and_private(self) -> None:
         store = AtomicStore(self.work / "restore" / "state.json")

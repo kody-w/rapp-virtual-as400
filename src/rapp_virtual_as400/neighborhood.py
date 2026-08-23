@@ -38,6 +38,9 @@ MAX_RESTORE_MESSAGE_BYTES = MAX_RESTORE_SNAPSHOT_BYTES + 1024
 NODE_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,31}$")
 BUNDLE_NAME_RE = re.compile(r"intent-[1-9][0-9]*\.json")
 BUNDLE_TEMP_RE = re.compile(r"\.intent-[1-9][0-9]*\.json\.[0-9a-f]{32}\.tmp")
+REPLAY_ROOT_RE = re.compile(r"\.replay-[0-9a-f]{32}")
+MAX_REPLAY_ROOT_ENTRIES = 8
+PROCESS_CLOSE_TIMEOUT_SECONDS = 2
 
 
 def _json_bytes(value: object) -> bytes:
@@ -835,19 +838,35 @@ class NodeProcess:
         return response
 
     def close(self) -> None:
+        failure: Exception | None = None
         if self._process.poll() is None:
             try:
                 self.request({"protocol": "RAPP/1", "kind": "control", "operation": "stop"})
-                self._process.wait(timeout=2)
-            except (Refusal, subprocess.TimeoutExpired):
-                self._process.terminate()
-                self._process.wait(timeout=2)
-        if self._process.stdin:
-            self._process.stdin.close()
-        if self._process.stdout:
-            self._process.stdout.close()
-        if self._process.stderr:
-            self._process.stderr.close()
+                self._process.wait(timeout=PROCESS_CLOSE_TIMEOUT_SECONDS)
+            except Exception as error:
+                failure = error
+                if self._process.poll() is None:
+                    try:
+                        self._process.terminate()
+                        self._process.wait(timeout=PROCESS_CLOSE_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        self._process.kill()
+                        self._process.wait(timeout=PROCESS_CLOSE_TIMEOUT_SECONDS)
+                    except Exception as terminate_error:
+                        failure = terminate_error
+        for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
+            if stream:
+                try:
+                    stream.close()
+                except OSError as error:
+                    failure = failure or error
+        if self._process.poll() is None:
+            raise Refusal(f"Node {self.node_id} could not be stopped.", "NODE_UNAVAILABLE")
+        if failure is not None and not isinstance(failure, (Refusal, subprocess.TimeoutExpired)):
+            raise Refusal(
+                f"Node {self.node_id} close was not clean ({type(failure).__name__}).",
+                "NODE_UNAVAILABLE",
+            ) from failure
 
 
 class PrivateVNetNeighborhood:
@@ -1091,6 +1110,109 @@ class PrivateVNetNeighborhood:
             except Exception as error:
                 failures.append(f"{node_id}: restore verification failed ({type(error).__name__})")
         return restored_hashes, failures
+
+    def _live_node_fingerprint(self) -> dict[str, dict[str, tuple[int, str]]]:
+        fingerprints: dict[str, dict[str, tuple[int, str]]] = {}
+        for node_id, node in self.nodes.items():
+            files: dict[str, tuple[int, str]] = {}
+            entries = list(node.root.iterdir())
+            if len(entries) > MAX_REPLAY_ROOT_ENTRIES:
+                raise Refusal("Live node root exceeds its replay audit bound.", "REPLAY_UNSAFE")
+            for child in sorted(entries, key=lambda item: item.name):
+                metadata = child.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise Refusal("Live node state contains an unsafe entry.", "REPLAY_UNSAFE")
+                encoded = child.read_bytes()
+                files[child.name] = (len(encoded), hashlib.sha256(encoded).hexdigest())
+            fingerprints[node_id] = files
+        return fingerprints
+
+    def _evidence_fingerprint(self) -> tuple[tuple[str, int, str], ...]:
+        paths = [self.ledger.path, self.ledger._bundle_bytes_path]
+        paths.extend(sorted(self.ledger._snapshots_path.iterdir(), key=lambda item: item.name))
+        fingerprint: list[tuple[str, int, str]] = []
+        for path in paths:
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise Refusal("Replay evidence contains an unsafe entry.", "EVIDENCE_INVALID")
+            encoded = path.read_bytes()
+            fingerprint.append(
+                (
+                    path.relative_to(self.ledger.path.parent).as_posix(),
+                    len(encoded),
+                    hashlib.sha256(encoded).hexdigest(),
+                )
+            )
+        return tuple(fingerprint)
+
+    def _create_disposable_replay_root(self) -> Path:
+        stale = [
+            child
+            for child in self.root.iterdir()
+            if child.name.startswith(".replay-")
+        ]
+        if stale:
+            raise Refusal(
+                "A prior disposable replay root was not proven erased.",
+                "REPLAY_CLEANUP_REQUIRED",
+            )
+        for _ in range(MAX_REPLAY_ROOT_ENTRIES):
+            candidate = self.root / f".replay-{uuid.uuid4().hex}"
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            try:
+                os.chmod(candidate, 0o700)
+                metadata = candidate.lstat()
+                if (
+                    candidate.parent != self.root
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                ):
+                    raise Refusal("Disposable replay root is unsafe.", "REPLAY_UNSAFE")
+                _fsync_directory(self.root)
+            except Exception as error:
+                try:
+                    cleanup_metadata = candidate.lstat()
+                    if stat.S_ISDIR(cleanup_metadata.st_mode) and not candidate.is_symlink():
+                        if any(candidate.iterdir()):
+                            raise OSError("replay setup root was not empty")
+                        candidate.rmdir()
+                    else:
+                        candidate.unlink()
+                    _fsync_directory(self.root)
+                except Exception as cleanup_error:
+                    raise Refusal(
+                        "Disposable replay setup cleanup was not proven.",
+                        "REPLAY_CLEANUP_FAILED",
+                    ) from cleanup_error
+                if isinstance(error, Refusal):
+                    raise
+                raise Refusal(
+                    "Disposable replay root publication was not proven.",
+                    "REPLAY_UNSAFE",
+                ) from error
+            return candidate
+        raise Refusal("Could not allocate a unique disposable replay root.", "REPLAY_UNSAFE")
+
+    def _erase_disposable_replay_root(self, replay_root: Path) -> None:
+        if (
+            replay_root.parent != self.root
+            or REPLAY_ROOT_RE.fullmatch(replay_root.name) is None
+            or replay_root.is_symlink()
+        ):
+            raise Refusal("Disposable replay cleanup path is unsafe.", "REPLAY_CLEANUP_FAILED")
+        entries = list(replay_root.iterdir())
+        if len(entries) > MAX_REPLAY_ROOT_ENTRIES:
+            raise Refusal("Disposable replay cleanup exceeds its bound.", "REPLAY_CLEANUP_FAILED")
+        for child in entries:
+            metadata = child.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise Refusal("Disposable replay cleanup found an unsafe entry.", "REPLAY_CLEANUP_FAILED")
+            child.unlink()
+        replay_root.rmdir()
+        _fsync_directory(self.root)
 
     @staticmethod
     def _failure_details(error: Exception) -> dict[str, str]:
@@ -1396,51 +1518,176 @@ class PrivateVNetNeighborhood:
             if node_id not in self.nodes:
                 raise Refusal(f"Node {node_id} is not in this neighborhood.", "OBJECT_NOT_FOUND")
             entries = self.ledger.audit()
-            node = self.nodes[node_id]
-            before = self._snapshots()[node_id]
+            live_snapshots = self._snapshots()
+            live_state_hashes = {
+                name: _digest(snapshot) for name, snapshot in live_snapshots.items()
+            }
+            if (
+                len(set(live_state_hashes.values())) != 1
+                or any(snapshot != live_snapshots[node_id] for snapshot in live_snapshots.values())
+            ):
+                raise Refusal("Live nodes are not converged for replay.", "REPLAY_DIVERGED")
+            live_fingerprint = self._live_node_fingerprint()
+            evidence_fingerprint = self._evidence_fingerprint()
+            commits = [
+                entry for entry in entries
+                if entry["record"].get("type") == "replicated_chat_commit"
+            ]
+            replay_root: Path | None = None
+            disposable: NodeProcess | None = None
+            result: dict | None = None
+            replay_error: BaseException | None = None
+            cleanup_errors: list[str] = []
             try:
-                self._checked_response(
-                    node_id,
-                    node.request({"protocol": "RAPP/1", "kind": "control", "operation": "reset"}),
-                    "reset",
+                replay_root = self._create_disposable_replay_root()
+                disposable = NodeProcess(
+                    f"REPLAY-{uuid.uuid4().hex[:12].upper()}",
+                    replay_root,
                 )
                 replayed = 0
-                for entry in entries:
+                if commits:
+                    first_record = commits[0]["record"]
+                    first_bundle = self.ledger.read_snapshot_bundle(
+                        first_record["snapshot_bundle"]
+                    )
+                    initial = first_bundle["pre_snapshots"][node_id]
+                    restore = self._checked_response(
+                        disposable.node_id,
+                        disposable.request(
+                            {
+                                "protocol": "RAPP/1",
+                                "kind": "control",
+                                "operation": "restore",
+                                "state": initial,
+                            }
+                        ),
+                        "restore",
+                    )
+                    if restore.get("state_hash") != _digest(initial):
+                        raise Refusal(
+                            "Disposable replay restore hash diverged.",
+                            "REPLAY_DIVERGED",
+                        )
+                for entry in commits:
                     record = entry["record"]
-                    if record.get("type") == "replicated_chat_commit":
-                        result = self._checked_response(node_id, node.request(record["message"]))
-                        expected = record["results"][node_id]
-                        if result != expected:
-                            raise Refusal(
-                                "Replay result diverged from append-only evidence.",
-                                "REPLAY_DIVERGED",
-                            )
-                        replayed += 1
-                state_hashes = {name: _digest(state) for name, state in self._snapshots().items()}
-                if len(set(state_hashes.values())) != 1:
-                    raise Refusal("Replayed node did not converge.", "REPLAY_DIVERGED")
-            except Exception:
-                self._checked_response(
-                    node_id,
-                    node.request(
-                        {
-                            "protocol": "RAPP/1",
-                            "kind": "control",
-                            "operation": "restore",
-                            "state": before,
-                        }
+                    bundle = self.ledger.read_snapshot_bundle(record["snapshot_bundle"])
+                    expected_pre = bundle["pre_snapshots"][node_id]
+                    pre_response = self._checked_response(
+                        disposable.node_id,
+                        disposable.request(
+                            {"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"}
+                        ),
+                        "snapshot",
+                    )
+                    actual_pre = AtomicStore.validate_snapshot(pre_response.get("state"))
+                    if actual_pre != expected_pre:
+                        raise Refusal(
+                            "Replay pre-state diverged from append-only evidence.",
+                            "REPLAY_DIVERGED",
+                        )
+                    expected_results = list(record["results"].values())
+                    if any(expected != expected_results[0] for expected in expected_results[1:]):
+                        raise Refusal(
+                            "Recorded replay results are not converged.",
+                            "EVIDENCE_INVALID",
+                        )
+                    actual_result = self._checked_response(
+                        disposable.node_id,
+                        disposable.request(record["message"]),
+                    )
+                    if any(actual_result != expected for expected in expected_results):
+                        raise Refusal(
+                            "Replay result diverged from append-only evidence.",
+                            "REPLAY_DIVERGED",
+                        )
+                    post_response = self._checked_response(
+                        disposable.node_id,
+                        disposable.request(
+                            {"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"}
+                        ),
+                        "snapshot",
+                    )
+                    post_state = AtomicStore.validate_snapshot(post_response.get("state"))
+                    if any(
+                        _digest(post_state) != expected_hash
+                        for expected_hash in record["state_hashes"].values()
+                    ):
+                        raise Refusal(
+                            "Replay event state diverged from append-only evidence.",
+                            "REPLAY_DIVERGED",
+                        )
+                    replayed += 1
+                final_response = self._checked_response(
+                    disposable.node_id,
+                    disposable.request(
+                        {"protocol": "RAPP/1", "kind": "control", "operation": "snapshot"}
                     ),
-                    "restore",
+                    "snapshot",
                 )
-                raise
-            return {
-                "protocol": "RAPP/1",
-                "control": "replay",
-                "node_id": node_id,
-                "events_replayed": replayed,
-                "converged": True,
-                "state_hash": next(iter(state_hashes.values())),
-            }
+                final_state = AtomicStore.validate_snapshot(final_response.get("state"))
+                if (
+                    final_state != live_snapshots[node_id]
+                    or _digest(final_state) != live_state_hashes[node_id]
+                ):
+                    raise Refusal(
+                        "Disposable replay did not converge with live state.",
+                        "REPLAY_DIVERGED",
+                    )
+                result = {
+                    "protocol": "RAPP/1",
+                    "control": "replay",
+                    "node_id": node_id,
+                    "events_replayed": replayed,
+                    "converged": True,
+                    "state_hash": live_state_hashes[node_id],
+                }
+            except BaseException as error:
+                replay_error = error
+            finally:
+                if disposable is not None:
+                    try:
+                        disposable.close()
+                    except Exception as error:
+                        cleanup_errors.append(f"close failed ({type(error).__name__})")
+                if replay_root is not None:
+                    if disposable is None:
+                        cleanup_errors.append("disposable setup status was not proven")
+                    elif disposable._process.poll() is not None:
+                        try:
+                            self._erase_disposable_replay_root(replay_root)
+                        except Exception as error:
+                            cleanup_errors.append(f"erase failed ({type(error).__name__})")
+                    else:
+                        cleanup_errors.append("disposable process remained running")
+
+            try:
+                current_snapshots = self._snapshots()
+                if (
+                    current_snapshots != live_snapshots
+                    or self._live_node_fingerprint() != live_fingerprint
+                    or self._evidence_fingerprint() != evidence_fingerprint
+                ):
+                    raise Refusal(
+                        "Replay isolation invariant could not be verified.",
+                        "REPLAY_ISOLATION_FAILED",
+                    )
+            except Exception as error:
+                if isinstance(error, Refusal) and error.code == "REPLAY_ISOLATION_FAILED":
+                    raise
+                raise Refusal(
+                    "Replay isolation invariant could not be verified.",
+                    "REPLAY_ISOLATION_FAILED",
+                ) from error
+            if cleanup_errors:
+                raise Refusal(
+                    "Disposable replay cleanup was not proven: " + "; ".join(cleanup_errors) + ".",
+                    "REPLAY_CLEANUP_FAILED",
+                ) from replay_error
+            if replay_error is not None:
+                raise replay_error
+            if result is None:
+                raise Refusal("Disposable replay produced no result.", "REPLAY_DIVERGED")
+            return result
 
     def run_replicated_job(
         self,

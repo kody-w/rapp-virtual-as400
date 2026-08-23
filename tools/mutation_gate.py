@@ -268,8 +268,8 @@ MUTATIONS = [
     Mutation(
         "replay-commits-only",
         "neighborhood.py",
-        'if record.get("type") == "replicated_chat_commit":',
-        'if record.get("type") == "replicated_chat_intent":',
+        'if entry["record"].get("type") == "replicated_chat_commit"',
+        'if entry["record"].get("type") == "replicated_chat_intent"',
         (
             "from pathlib import Path\n"
             "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
@@ -277,6 +277,94 @@ MUTATIONS = [
             " n.replicate_chat('CRTLIB LIB(REPLAY)','replay','replay')\n"
             " result=n.replay_and_verify('AS400-B')\n"
             " raise SystemExit(0 if result['events_replayed']==1 else 1)\n"
+        ),
+    ),
+    Mutation(
+        "replay-disposable-node",
+        "neighborhood.py",
+        (
+            "                disposable = NodeProcess(\n"
+            '                    f"REPLAY-{uuid.uuid4().hex[:12].upper()}",\n'
+            "                    replay_root,\n"
+            "                )"
+        ),
+        "                disposable = self.nodes[node_id]",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " n.replicate_chat('CRTLIB LIB(ISOLATED)','replay','isolated')\n"
+            " before={name:(node.root/'state.json').read_bytes() for name,node in n.nodes.items()}\n"
+            " result=n.replay_and_verify('AS400-B')\n"
+            " after={name:(node.root/'state.json').read_bytes() for name,node in n.nodes.items()}\n"
+            " good=result['converged'] and before==after and n.topology()['node_count']==2\n"
+            " raise SystemExit(0 if good else 1)\n"
+        ),
+    ),
+    Mutation(
+        "replay-every-recorded-result",
+        "neighborhood.py",
+        "                    if any(actual_result != expected for expected in expected_results):",
+        "                    if False:",
+        (
+            "from pathlib import Path\n"
+            "import copy\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood,Refusal\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " n.replicate_chat('CRTLIB LIB(RESULT)','replay','result')\n"
+            " audit=n.ledger.audit\n"
+            " def altered():\n"
+            "  entries=copy.deepcopy(audit())\n"
+            "  record=entries[-1]['record']\n"
+            "  for value in record['results'].values(): value['response']='tampered'\n"
+            "  return entries\n"
+            " n.ledger.audit=altered\n"
+            " try: n.replay_and_verify('AS400-A')\n"
+            " except Refusal: raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "replay-every-event-state-hash",
+        "neighborhood.py",
+        (
+            "                    if any(\n"
+            "                        _digest(post_state) != expected_hash\n"
+            '                        for expected_hash in record["state_hashes"].values()\n'
+            "                    ):"
+        ),
+        "                    if False:",
+        (
+            "from pathlib import Path\n"
+            "import copy\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood,Refusal\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " n.replicate_chat('CRTLIB LIB(STATE)','replay','state')\n"
+            " audit=n.ledger.audit\n"
+            " def altered():\n"
+            "  entries=copy.deepcopy(audit())\n"
+            "  record=entries[-1]['record']\n"
+            "  record['state_hashes']={key:'0'*64 for key in record['state_hashes']}\n"
+            "  return entries\n"
+            " n.ledger.audit=altered\n"
+            " try: n.replay_and_verify('AS400-A')\n"
+            " except Refusal: raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "replay-disposable-cleanup",
+        "neighborhood.py",
+        "                            self._erase_disposable_replay_root(replay_root)",
+        "                            pass",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " n.replicate_chat('CRTLIB LIB(CLEAN)','replay','clean')\n"
+            " n.replay_and_verify('AS400-A')\n"
+            " stale=any(path.name.startswith('.replay-') for path in n.root.iterdir())\n"
+            " raise SystemExit(1 if stale else 0)\n"
         ),
     ),
     Mutation(

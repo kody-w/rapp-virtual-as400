@@ -35,9 +35,9 @@ lock plus `flock` on POSIX or one-byte `msvcrt` locking on Windows serializes
 the whole reserve, intent, snapshot bundle, mutation, rollback, and terminal
 evidence transaction. Separate neighborhood or `EvidenceLedger` instances
 using the same root refresh the on-disk tail while holding this lock. Direct
-node chat, replay/reset, and replicated-run evidence use the same authority,
-so one instance cannot append a duplicate sequence or roll back another
-instance's completed write.
+node chat, disposable replay, and replicated-run evidence use the same
+authority, so one instance cannot append a duplicate sequence or roll back
+another instance's completed write.
 
 State, snapshot, bundle-accounting, and new-ledger publications share one
 directory-durability primitive. Every platform flushes file contents before
@@ -100,11 +100,22 @@ restore/runtime. The immutable bundle bytes, path, size, digest, and recorded
 raw state hashes are never rewritten; current-format bundles still read back
 exactly.
 
-`replay_and_verify()` resets one selected node through its fixed typed control
-operation, verifies the complete evidence hash chain and referenced bundles,
-replays committed chat events only, ignores intents/failures/recoveries, and
-requires byte-canonical state convergence with its peers. A failed replay
-restores the selected node's exact pre-replay state.
+`replay_and_verify()` verifies the complete evidence hash chain and every
+referenced bundle under the root lock, then captures every live node snapshot,
+state-file fingerprint, and the evidence fingerprint. It refuses a divergent
+live neighborhood before setup. Replay creates a private `0700`, uniquely
+named disposable root alongside (never inside) the live node roots, restores
+the selected node's first committed pre-state there, and replays committed
+chat events only in ledger order. Every event's recorded result, pre-state,
+and post-state hash must agree, and the disposable final snapshot and hash
+must equal the selected and converged live state.
+
+The disposable process is stopped and its bounded flat state root is erased
+on success or failure. Setup refuses when an earlier replay root was not
+proven erased. Close, erase, or directory-durability uncertainty fails replay
+closed, while live nodes remain operable and their state bytes/hashes and all
+evidence bytes are rechecked unchanged. No replay path sends reset, restore,
+or chat controls to a live node.
 
 Normal appends refresh sequence and hash from one bounded tail read instead of
 parsing all historical JSONL. Permissions and byte/event capacity are checked
@@ -137,5 +148,5 @@ PYTHONPATH=src python3 -m rapp_virtual_as400 \
 ```
 
 The proof starts at least two isolated processes, converges a replicated chat,
-runs 100 deterministic simulations with all-identical results, replays one
-node from evidence, and prints the typed proof JSON.
+runs 100 deterministic simulations with all-identical results, replays the
+selected history on a disposable node, and prints the typed proof JSON.

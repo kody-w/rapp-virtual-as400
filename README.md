@@ -44,8 +44,9 @@ credentials or production data. It is not production software.**
   replacement. The same 4 MiB canonical serialized-state cap is checked before
   every atomic write and transaction commit; rejected growth leaves the prior
   revision and bytes intact. Unexpected worker errors become stable refusals.
-- Evidence proves deterministic replication, replay, and convergence,
-  including a 100-replica release proof.
+- Evidence proves deterministic replication, disposable replay, and
+  convergence, including a 100-replica release proof. Replay never resets or
+  restores a live neighborhood node.
 
 ## Quick start
 
@@ -135,9 +136,10 @@ PYTHONPATH=src python3 -m rapp_virtual_as400 \
 ```
 
 The proof converges replicated state, executes 100 bounded deterministic job
-simulations with all results identical, replays one node from append-only
-hash-chained evidence, and verifies convergence. Stochastic runs require an
-exact quorum declared before execution and retain every outlier.
+simulations with all results identical, replays committed chats on a private
+unique disposable node from append-only hash-chained evidence, and verifies
+convergence without mutating the selected live node. Stochastic runs require
+an exact quorum declared before execution and retain every outlier.
 
 ## RAPP Zoo v2
 

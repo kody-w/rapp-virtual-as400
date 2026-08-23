@@ -109,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
             response = Refusal("Worker message must be valid JSON.", "INVALID_REQUEST").envelope("")
         except Refusal as error:
             response = error.envelope(session_id)
+        except Exception:
+            response = Refusal(
+                "Worker could not safely process the request.",
+                "WORKER_ERROR",
+            ).envelope(session_id)
         sys.stdout.write(json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         if stop:

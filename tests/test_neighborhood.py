@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
-from rapp_virtual_as400 import PrivateVNetNeighborhood, Refusal
-from rapp_virtual_as400.storage import AtomicStore
+from rapp_virtual_as400 import PrivateVNetNeighborhood, Refusal, VirtualAS400
+from rapp_virtual_as400.storage import AtomicStore, empty_state
 import rapp_virtual_as400.neighborhood as neighborhood_module
 
 from .support import EngineTestCase
@@ -111,15 +115,21 @@ class NeighborhoodTests(EngineTestCase):
             )
             failure = entries[1]["record"]
             self.assertEqual(failure["intent_event_hash"], entries[0]["event_hash"])
-            self.assertEqual(failure["pre_snapshots"], before)
+            self.assertNotIn("pre_snapshots", failure)
             self.assertTrue(failure["rollback_verified"])
-            snapshot_file = (
-                neighborhood.ledger.path.parent
-                / entries[0]["record"]["pre_event_snapshot_file"]
+            self.assertEqual(
+                failure["snapshot_bundle"]["path"],
+                entries[0]["record"]["snapshot_bundle_path"],
             )
-            bundle = json.loads(snapshot_file.read_text(encoding="utf-8"))
+            snapshot_file = neighborhood.ledger.path.parent / failure["snapshot_bundle"]["path"]
+            bundle = neighborhood.ledger.read_snapshot_bundle(failure["snapshot_bundle"])
             self.assertEqual(bundle["pre_snapshots"], before)
-            self.assertEqual(bundle["intent_event_hash"], entries[0]["event_hash"])
+            encoded = snapshot_file.read_bytes()
+            self.assertEqual(failure["snapshot_bundle"]["bytes"], len(encoded))
+            self.assertEqual(
+                failure["snapshot_bundle"]["sha256"],
+                hashlib.sha256(encoded).hexdigest(),
+            )
             self.assertEqual(os.stat(snapshot_file).st_mode & 0o777, 0o600)
 
     def test_result_divergence_rolls_back_every_node(self) -> None:
@@ -209,6 +219,8 @@ class NeighborhoodTests(EngineTestCase):
             )
             self.assertEqual(entries[1]["record"]["failure"]["code"], "EVIDENCE_IO_FAILED")
             self.assertTrue(entries[1]["record"]["rollback_verified"])
+            self.assertNotIn("pre_snapshots", entries[1]["record"])
+            neighborhood.ledger.audit()
 
     def test_rollback_acknowledgement_hash_is_verified(self) -> None:
         with PrivateVNetNeighborhood(self.work / "vnet") as neighborhood:
@@ -296,3 +308,122 @@ class NeighborhoodTests(EngineTestCase):
                 self.assertEqual(os.stat(child.root).st_mode & 0o777, 0o700)
                 self.assertEqual(os.stat(child.root / "state.json").st_mode & 0o777, 0o600)
                 self.assertEqual(os.stat(child.root / "state.json.lock").st_mode & 0o777, 0o600)
+
+    def test_two_instances_serialize_complete_replication_transactions(self) -> None:
+        root = self.work / "shared"
+        first = PrivateVNetNeighborhood(root)
+        second = PrivateVNetNeighborhood(root)
+        entered = threading.Event()
+        release = threading.Event()
+        original = first.nodes["AS400-A"].request
+
+        def pause_first_chat(message: dict) -> dict:
+            if message.get("kind") == "chat":
+                entered.set()
+                if not release.wait(3):
+                    raise AssertionError("concurrency test release timed out")
+            return original(message)
+
+        first.nodes["AS400-A"].request = pause_first_chat  # type: ignore[method-assign]
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                one = executor.submit(
+                    first.replicate_chat,
+                    "CRTLIB LIB(FIRST)",
+                    "first",
+                    "first",
+                )
+                self.assertTrue(entered.wait(3))
+                two = executor.submit(
+                    second.replicate_chat,
+                    "CRTLIB LIB(SECOND)",
+                    "second",
+                    "second",
+                )
+                time.sleep(0.1)
+                self.assertFalse(two.done())
+                release.set()
+                one.result(timeout=5)
+                two.result(timeout=5)
+            entries = first.ledger.audit()
+            self.assertEqual([entry["sequence"] for entry in entries], [1, 2, 3, 4])
+            self.assertEqual(len({entry["event_hash"] for entry in entries}), 4)
+            snapshots = second._snapshots()
+            for state in snapshots.values():
+                self.assertEqual(set(state["libraries"]), {"FIRST", "SECOND"})
+        finally:
+            release.set()
+            first.close()
+            second.close()
+
+    def test_stale_ledgers_refresh_bounded_tail_without_full_read(self) -> None:
+        path = self.work / "evidence" / "events.jsonl"
+        first = neighborhood_module.EvidenceLedger(path)
+        stale = neighborhood_module.EvidenceLedger(path)
+        first.append({"type": "one"})
+        with mock.patch.object(stale, "read", side_effect=AssertionError("full read used")):
+            second_entry = stale.append({"type": "two"})
+        third_entry = first.append({"type": "three"})
+        self.assertEqual((second_entry["sequence"], third_entry["sequence"]), (2, 3))
+        self.assertEqual(len(first.read()), 3)
+
+    def test_large_snapshot_exists_once_and_bundle_tampering_is_refused(self) -> None:
+        root = self.work / "large"
+        for node_id in ("AS400-A", "AS400-B"):
+            store = AtomicStore(root / "nodes" / node_id / "state.json")
+            state = empty_state()
+            state["revision"] = 1
+            state["libraries"]["BIG"] = {"files": {}}
+            state["data_queues"]["BIG/QUEUE"] = ["x" * 2048 for _ in range(100)]
+            store.restore(state)
+        with PrivateVNetNeighborhood(root) as neighborhood:
+            neighborhood.replicate_chat("DSPLIB", "large", "large")
+            entries = neighborhood.ledger.audit()
+            terminal = entries[-1]["record"]
+            self.assertNotIn("pre_snapshots", terminal)
+            reference = terminal["snapshot_bundle"]
+            self.assertGreater(reference["bytes"], 400_000)
+            self.assertLess(neighborhood.ledger.path.stat().st_size, reference["bytes"])
+            bundle_path = neighborhood.ledger.path.parent / reference["path"]
+            with bundle_path.open("r+b") as handle:
+                handle.seek(0)
+                handle.write(b" ")
+                handle.flush()
+                os.fsync(handle.fileno())
+            before = neighborhood._snapshots()["AS400-B"]
+            with self.assertRaisesRegex(Refusal, "digest"):
+                neighborhood.replay_and_verify("AS400-B")
+            self.assertEqual(neighborhood._snapshots()["AS400-B"], before)
+
+    def test_snapshot_bundle_rejects_digest_and_escape_references(self) -> None:
+        path = self.work / "evidence" / "events.jsonl"
+        ledger = neighborhood_module.EvidenceLedger(path)
+        bundle = {"pre_snapshots": {}, "pre_state_hashes": {}}
+        reference = ledger.write_snapshot_bundle("intent-1.json", bundle)
+        with self.assertRaisesRegex(Refusal, "digest"):
+            ledger.read_snapshot_bundle({**reference, "sha256": "0" * 64})
+        with self.assertRaisesRegex(Refusal, "reference"):
+            ledger.read_snapshot_bundle({**reference, "path": "../state.json"})
+
+    def test_byte_capacity_preflight_happens_before_chat_mutation(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "capacity") as neighborhood:
+            chat_contacts = 0
+            originals = {name: node.request for name, node in neighborhood.nodes.items()}
+
+            def counted(node_id: str, message: dict) -> dict:
+                nonlocal chat_contacts
+                if message.get("kind") == "chat":
+                    chat_contacts += 1
+                return originals[node_id](message)
+
+            for node_id, node in neighborhood.nodes.items():
+                node.request = lambda message, node_id=node_id: counted(node_id, message)  # type: ignore[method-assign]
+            with mock.patch.object(
+                neighborhood_module,
+                "MAX_EVIDENCE_BYTES",
+                neighborhood_module.MAX_EVIDENCE_RECORD_BYTES,
+            ):
+                with self.assertRaisesRegex(Refusal, "Evidence byte limit"):
+                    neighborhood.replicate_chat("CRTLIB LIB(FULL)", "full", "full")
+            self.assertEqual(chat_contacts, 0)
+            self.assertEqual(neighborhood._snapshots()["AS400-A"]["libraries"], {})

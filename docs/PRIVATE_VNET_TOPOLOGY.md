@@ -30,11 +30,22 @@ and is not used for inter-node traffic.
 
 ## Replication and evidence
 
-`PrivateVNetNeighborhood.replicate_chat()` first reserves evidence capacity
-and durably appends an intent before contacting a node. It then captures each
-exact pre-event snapshot and hash before sending the same typed RAPP/1 chat
-event, idempotency key, and deterministic event timestamp to every node. A
-linked commit is appended only when response hashes and complete
+Every neighborhood root owns one private lock file. A reentrant in-process
+lock plus `flock` on POSIX or one-byte `msvcrt` locking on Windows serializes
+the whole reserve, intent, snapshot bundle, mutation, rollback, and terminal
+evidence transaction. Separate neighborhood or `EvidenceLedger` instances
+using the same root refresh the on-disk tail while holding this lock. Direct
+node chat, replay/reset, and replicated-run evidence use the same authority,
+so one instance cannot append a duplicate sequence or roll back another
+instance's completed write.
+
+`PrivateVNetNeighborhood.replicate_chat()` reserves two event slots and
+durably appends an intent before contacting any node. It then captures and
+validates each exact pre-event snapshot and preflights the remaining maximum
+terminal record + bundle byte budget before mutation. It writes the snapshots
+exactly once as an immutable `0600` JSON bundle before sending the same typed
+RAPP/1 chat event, idempotency key, and deterministic event timestamp to every
+node. A linked commit is appended only when response hashes and complete
 persisted-state hashes agree.
 
 Any node failure, result/state divergence, or terminal evidence failure
@@ -42,12 +53,28 @@ restores every node through the bounded restore control and verifies each
 restored hash against its exact pre-event snapshot. A linked failure/rollback
 record is appended when evidence I/O permits; an unpaired durable intent makes
 terminal evidence I/O failure visible. Restore snapshots use strict schema,
-depth, and size validation and atomic private writes.
+type/value/limit, object-name, counter/revision, queue/job referential, depth,
+and size validation before atomic private writes. Unexpected engine failures
+are returned as stable `WORKER_ERROR` refusals without turning failures into
+successes.
+
+Terminal records do not duplicate snapshots. They retain only an immutable
+relative bundle reference, SHA-256, byte count, pre-state hashes, and restore
+hashes/status alongside the event result. Replay and full evidence audit
+reject absolute/traversing/symlinked bundle paths, missing bundles, digest or
+size changes, and malformed bundle snapshots. The configured evidence byte
+cap covers both JSONL and bundles, each JSONL record has its own bound, and
+capacity failure occurs before mutation.
 
 `replay_and_verify()` resets one selected node through its fixed typed control
-operation, verifies the evidence hash chain, replays committed chat events
-only, ignores intents/failures, and requires byte-canonical state convergence
-with its peers.
+operation, verifies the complete evidence hash chain and referenced bundles,
+replays committed chat events only, ignores intents/failures, and requires
+byte-canonical state convergence with its peers. A failed replay restores the
+selected node's exact pre-replay state.
+
+Normal appends refresh sequence and hash from one bounded tail read instead of
+parsing all historical JSONL. Full `read()`/`audit()` still validates every
+sequence and hash link.
 
 `run_replicated_job()` runs 1–100 bounded simulations across the node
 processes:

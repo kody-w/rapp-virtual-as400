@@ -23,8 +23,16 @@ credentials or production data. It is not production software.**
 - Idempotency, durable sessions, concurrency serialization, and bounded data.
 - A provider-neutral private-vNet simulator runs isolated local node
   processes over typed parent/child pipes, without LAN or sibling routes.
-- Hash-chained evidence proves deterministic replication, replay, and
-  convergence, including a 100-replica release proof.
+- A root-scoped POSIX/Windows interprocess lock serializes complete
+  neighborhood mutation, rollback, reset/replay, and evidence transactions.
+- Byte-capped, hash-chained evidence keeps exact pre-state snapshots once in
+  immutable private bundles; terminal records contain verified references,
+  hashes, byte counts, and restore status rather than duplicate snapshots.
+- Strict restore validation covers object grammar, schema/value limits,
+  counters, revisions, and queue/job referential integrity before atomic
+  replacement. Unexpected worker errors become stable refusals.
+- Evidence proves deterministic replication, replay, and convergence,
+  including a 100-replica release proof.
 
 ## Quick start
 

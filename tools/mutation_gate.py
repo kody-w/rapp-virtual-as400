@@ -236,6 +236,98 @@ MUTATIONS = [
             " raise SystemExit(0 if result['events_replayed']==1 else 1)\n"
         ),
     ),
+    Mutation(
+        "root-interprocess-lock",
+        "storage.py",
+        "                fcntl.flock(descriptor, fcntl.LOCK_EX)",
+        "                pass",
+        (
+            "from pathlib import Path\n"
+            "import subprocess,sys,time\n"
+            "worker=\"\"\"from pathlib import Path\n"
+            "import sys,time\n"
+            "from rapp_virtual_as400.storage import root_lock\n"
+            "with root_lock(Path('shared')):\n"
+            " Path(sys.argv[1]).write_text('entered')\n"
+            " if sys.argv[1]=='first':\n"
+            "  deadline=time.time()+5\n"
+            "  while not Path('release').exists() and time.time()<deadline: time.sleep(.01)\n"
+            "\"\"\"\n"
+            "one=subprocess.Popen([sys.executable,'-c',worker,'first'])\n"
+            "deadline=time.time()+5\n"
+            "while not Path('first').exists() and time.time()<deadline: time.sleep(.01)\n"
+            "two=subprocess.Popen([sys.executable,'-c',worker,'second'])\n"
+            "time.sleep(.2); early=Path('second').exists(); Path('release').write_text('go')\n"
+            "one.wait(timeout=5); two.wait(timeout=5)\n"
+            "raise SystemExit(1 if early or one.returncode or two.returncode else 0)\n"
+        ),
+    ),
+    Mutation(
+        "restore-queue-job-reference",
+        "storage.py",
+        '        if set(queued_ids) - set(snapshot["jobs"]):',
+        "        if False:",
+        (
+            "from rapp_virtual_as400.storage import empty_state,AtomicStore\n"
+            "from rapp_virtual_as400 import Refusal\n"
+            "s=empty_state(); s['revision']=1; s['libraries']['T']={'files':{}}; "
+            "s['job_queues']['T/Q']=['J000001']\n"
+            "try: AtomicStore.validate_snapshot(s)\n"
+            "except Refusal: raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "bundle-only-terminal-record",
+        "neighborhood.py",
+        (
+            '                            "pre_state_hashes": pre_state_hashes,\n'
+            '                            "results": results,'
+        ),
+        (
+            '                            "pre_snapshots": pre_snapshots,\n'
+            '                            "pre_state_hashes": pre_state_hashes,\n'
+            '                            "results": results,'
+        ),
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " n.replicate_chat('CRTLIB LIB(BUNDLE)','bundle','bundle')\n"
+            " terminal=n.ledger.read()[-1]['record']\n"
+            " raise SystemExit(0 if 'pre_snapshots' not in terminal else 1)\n"
+        ),
+    ),
+    Mutation(
+        "evidence-byte-preflight",
+        "neighborhood.py",
+        "            if self._evidence_bytes() + required > MAX_EVIDENCE_BYTES:",
+        "            if False:",
+        (
+            "from pathlib import Path\n"
+            "import rapp_virtual_as400.neighborhood as m\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood,Refusal\n"
+            "m.MAX_EVIDENCE_BYTES=m.MAX_EVIDENCE_RECORD_BYTES\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " try: n.replicate_chat('CRTLIB LIB(FULL)','full','full')\n"
+            " except Refusal: raise SystemExit(0 if not n._snapshots()['AS400-A']['libraries'] else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "stale-ledger-tail-refresh",
+        "neighborhood.py",
+        "            current, previous = self._refresh_tail()",
+        "            current, previous = self._sequence, self._previous",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400.neighborhood import EvidenceLedger\n"
+            "p=Path('evidence/events.jsonl'); a=EvidenceLedger(p); b=EvidenceLedger(p)\n"
+            "a.append({'type':'one'}); b.append({'type':'two'})\n"
+            "entries=a.read()\n"
+            "raise SystemExit(0 if [e['sequence'] for e in entries]==[1,2] else 1)\n"
+        ),
+    ),
 ]
 
 

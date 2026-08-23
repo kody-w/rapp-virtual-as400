@@ -614,6 +614,8 @@ class NeighborhoodTests(EngineTestCase):
         self.assertEqual(len(first.read()), 3)
 
     def test_append_checks_permissions_before_publication(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Windows privacy is enforced by inherited ACLs, not chmod")
         ledger = neighborhood_module.EvidenceLedger(
             self.work / "permissions" / "evidence" / "events.jsonl"
         )

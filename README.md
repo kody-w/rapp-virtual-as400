@@ -15,11 +15,17 @@ credentials or production data. It is not production software.**
 - Exact local RAPP/1 `POST /chat` response:
   `{response, agent_logs, session_id}`.
 - Typed `GET /health`; stable HTTP 422 refusal envelope.
-- Atomic JSON persistence in a private `0700` directory with `0600` files.
-  File contents are flushed before publication; POSIX also opens and flushes
-  the containing directory. Python cannot safely open directory handles on
-  Windows, so Windows deliberately stops after the file flush and atomic
-  replace/link rather than calling unsupported `os.open(directory)`.
+- Atomic JSON persistence in a private state root. On POSIX, exact `0700`
+  directory and `0600` file modes are enforced and validated. Windows POSIX
+  mode bits are synthetic and `chmod` does not manage ACLs, so the default
+  root stays under the user's profile and state, evidence, snapshots, and
+  capability files inherit that root's user-scoped ACL. A custom Windows
+  `--home` must likewise have a private ACL; no unsupported `0600`/`0700`
+  guarantee is claimed there. File contents are flushed before atomic
+  publication; POSIX also opens and flushes the containing directory. Python
+  cannot safely open directory handles on Windows, so Windows deliberately
+  stops after the file flush and atomic replace/link rather than calling
+  unsupported `os.open(directory)`.
 - Capability-token shutdown; no PID files or PID-signaling authority.
 - Strict allowlist parser. No shell, SQL, `eval`, filesystem commands,
   traversal, or outbound network feature exists.

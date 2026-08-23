@@ -13,6 +13,7 @@ from .errors import Refusal
 from .manifest import build_manifest
 from .neighborhood import PrivateVNetNeighborhood
 from .server import serve
+from .storage import enforce_private_mode
 
 
 def default_home() -> Path:
@@ -45,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     home = args.home.expanduser().resolve()
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(home, 0o700)
+    enforce_private_mode(home, 0o700)
     try:
         if args.action == "serve":
             print(

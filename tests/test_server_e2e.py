@@ -346,7 +346,11 @@ class ServerE2ETests(EngineTestCase):
     def test_stop_requires_capability_not_pid(self) -> None:
         status, _ = self.request("/admin/stop", {})
         self.assertEqual(status, 403)
-        token = (self.work / "stop.capability").read_text()
+        capability = self.work / "stop.capability"
+        self.assert_private_mode(capability, 0o600)
+        self.assert_private_mode(capability.parent, 0o700)
+        self.assertFalse(any(capability.parent.glob(".stop.capability.*.new")))
+        token = capability.read_text()
         status, body = self.request("/admin/stop", {}, token)
         self.assertEqual((status, body), (200, {"status": "stopping"}))
         self.thread.join(timeout=2)

@@ -462,7 +462,7 @@ MUTATIONS = [
     Mutation(
         "append-permission-preflight",
         "neighborhood.py",
-        "            os.chmod(self.path, 0o600)\n            metadata = self.path.lstat()",
+        "            enforce_private_mode(self.path, 0o600)\n            metadata = self.path.lstat()",
         "            metadata = self.path.lstat()",
         (
             "from pathlib import Path\n"

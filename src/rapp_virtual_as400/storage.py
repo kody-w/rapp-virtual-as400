@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import re
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -35,6 +36,23 @@ _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[Path, "PortableRootLock"] = {}
 
 
+def enforce_private_mode(path: str | os.PathLike[str], mode: int) -> None:
+    """Apply an exact private POSIX mode where mode bits are authoritative.
+
+    Windows ``chmod`` only controls the read-only attribute and ``stat`` reports
+    synthetic POSIX bits. Security there comes from the ACL inherited from the
+    caller-selected private root, so pretending to enforce 0600/0700 would be
+    misleading.
+    """
+    if os.name != "nt":
+        os.chmod(path, mode)
+
+
+def private_mode_mismatch(metadata_mode: int, expected: int) -> bool:
+    """Report an authoritative POSIX mismatch without interpreting Windows bits."""
+    return os.name != "nt" and stat.S_IMODE(metadata_mode) != expected
+
+
 def fsync_directory(path: Path) -> None:
     """Persist directory entries where the platform exposes a safe primitive.
 
@@ -58,7 +76,7 @@ class PortableRootLock:
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        enforce_private_mode(self.root, 0o700)
         self.path = self.root / ".neighborhood.lock"
         self._thread_lock = threading.RLock()
         self._local = threading.local()
@@ -71,7 +89,7 @@ class PortableRootLock:
             return self
         descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            os.chmod(self.path, 0o600)
+            enforce_private_mode(self.path, 0o600)
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
                 os.fsync(descriptor)
@@ -195,12 +213,12 @@ class AtomicStore:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
+        enforce_private_mode(self.path.parent, 0o700)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._thread_lock = threading.RLock()
         lock_descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         os.close(lock_descriptor)
-        os.chmod(self.lock_path, 0o600)
+        enforce_private_mode(self.lock_path, 0o600)
         with root_lock(self.path.parent):
             if not self.path.exists():
                 self._write(empty_state())
@@ -224,9 +242,9 @@ class AtomicStore:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(temp, 0o600)
+            enforce_private_mode(temp, 0o600)
             os.replace(temp, self.path)
-            os.chmod(self.path, 0o600)
+            enforce_private_mode(self.path, 0o600)
             fsync_directory(self.path.parent)
         finally:
             if temp.exists():

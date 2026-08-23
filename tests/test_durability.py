@@ -48,6 +48,17 @@ class DirectoryDurabilityContractTests(unittest.TestCase):
         opened.assert_not_called()
         fsynced.assert_not_called()
 
+    def test_simulated_windows_never_treats_posix_modes_as_acl_guarantees(self) -> None:
+        with (
+            mock.patch.object(storage_module.os, "chmod") as chmod,
+            mock.patch.object(storage_module.os, "name", "nt"),
+        ):
+            storage_module.enforce_private_mode(self.work, 0o700)
+            mismatch = storage_module.private_mode_mismatch(0o777, 0o600)
+
+        chmod.assert_not_called()
+        self.assertFalse(mismatch)
+
     def test_simulated_windows_atomic_store_flushes_file_and_replaces(self) -> None:
         store = AtomicStore(self.work / "store" / "state.json")
         state = empty_state()

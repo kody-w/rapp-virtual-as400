@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .engine import VirtualAS400
 from .errors import Refusal
+from .storage import enforce_private_mode, fsync_directory
 from .unicode_safe import canonical_json_strings
 
 MAX_REQUEST_BYTES = 8192
@@ -27,13 +28,27 @@ class RAPPServer(ThreadingHTTPServer):
         self.stop_capability = secrets.token_urlsafe(32)
         capability = Path(capability_path).expanduser().resolve()
         capability.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(capability.parent, 0o700)
-        descriptor = os.open(capability, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(self.stop_capability)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(capability, 0o600)
+        enforce_private_mode(capability.parent, 0o700)
+        temporary = capability.with_name(
+            f".{capability.name}.{secrets.token_hex(8)}.new"
+        )
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(self.stop_capability)
+                handle.flush()
+                os.fsync(handle.fileno())
+            enforce_private_mode(temporary, 0o600)
+            os.replace(temporary, capability)
+            enforce_private_mode(capability, 0o600)
+            fsync_directory(capability.parent)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         self.capability_path = capability
 
     def server_close(self) -> None:

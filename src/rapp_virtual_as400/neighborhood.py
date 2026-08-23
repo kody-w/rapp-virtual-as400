@@ -22,7 +22,9 @@ from .storage import (
     AtomicStore,
     MAX_RESTORE_SNAPSHOT_BYTES,
     PortableRootLock,
+    enforce_private_mode,
     fsync_directory as _fsync_directory,
+    private_mode_mismatch,
     root_lock,
 )
 from .unicode_safe import canonical_json_strings
@@ -66,7 +68,7 @@ class EvidenceLedger:
         self.transaction_lock = transaction_lock or root_lock(lock_root)
         with self.transaction_lock:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(self.path.parent, 0o700)
+            enforce_private_mode(self.path.parent, 0o700)
             self._bundle_bytes_path = self.path.parent / ".bundle-bytes"
             directory_changed = False
             if not self.path.exists():
@@ -76,13 +78,13 @@ class EvidenceLedger:
                 finally:
                     os.close(descriptor)
                 directory_changed = True
-            os.chmod(self.path, 0o600)
+            enforce_private_mode(self.path, 0o600)
             self._snapshots_path = self.path.parent / "snapshots"
             snapshots_created = not self._snapshots_path.exists()
             self._snapshots_path.mkdir(parents=False, exist_ok=True, mode=0o700)
             if self._snapshots_path.is_symlink() or not self._snapshots_path.is_dir():
                 raise Refusal("Snapshot evidence directory is unsafe.", "EVIDENCE_INVALID")
-            os.chmod(self._snapshots_path, 0o700)
+            enforce_private_mode(self._snapshots_path, 0o700)
             if snapshots_created or directory_changed:
                 _fsync_directory(self.path.parent)
             self._cleanup_stale_bundle_temps()
@@ -199,8 +201,9 @@ class EvidenceLedger:
                 handle.write(str(value))
                 handle.flush()
                 os.fsync(handle.fileno())
+            enforce_private_mode(temporary, 0o600)
             os.replace(temporary, self._bundle_bytes_path)
-            os.chmod(self._bundle_bytes_path, 0o600)
+            enforce_private_mode(self._bundle_bytes_path, 0o600)
             _fsync_directory(self.path.parent)
         finally:
             if temporary.exists():
@@ -577,11 +580,11 @@ class EvidenceLedger:
             metadata = self.path.lstat()
             if not stat.S_ISREG(metadata.st_mode):
                 raise Refusal("Evidence file is unsafe.", "EVIDENCE_INVALID")
-            os.chmod(self.path, 0o600)
+            enforce_private_mode(self.path, 0o600)
             metadata = self.path.lstat()
             if (
                 not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or private_mode_mismatch(metadata.st_mode, 0o600)
             ):
                 raise Refusal("Evidence file permissions are unsafe.", "EVIDENCE_INVALID")
             descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND, 0o600)
@@ -700,6 +703,7 @@ class EvidenceLedger:
                         raise OSError("Snapshot bundle write was incomplete.")
                     offset += written
                 os.fsync(descriptor)
+                enforce_private_mode(temporary, 0o600)
                 os.close(descriptor)
                 descriptor = -1
                 os.link(temporary, destination, follow_symlinks=False)
@@ -783,7 +787,7 @@ class NodeProcess:
         self.node_id = node_id
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        enforce_private_mode(self.root, 0o700)
         environment = {
             key: value
             for key, value in os.environ.items()
@@ -880,7 +884,7 @@ class PrivateVNetNeighborhood:
             raise Refusal("Node IDs must use bounded uppercase provider-neutral names.", "INVALID_TOPOLOGY")
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        enforce_private_mode(self.root, 0o700)
         self._root_lock = root_lock(self.root)
         self._replication_lock = threading.RLock()
         self._operable = False
@@ -1163,12 +1167,12 @@ class PrivateVNetNeighborhood:
             except FileExistsError:
                 continue
             try:
-                os.chmod(candidate, 0o700)
+                enforce_private_mode(candidate, 0o700)
                 metadata = candidate.lstat()
                 if (
                     candidate.parent != self.root
                     or not stat.S_ISDIR(metadata.st_mode)
-                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                    or private_mode_mismatch(metadata.st_mode, 0o700)
                 ):
                     raise Refusal("Disposable replay root is unsafe.", "REPLAY_UNSAFE")
                 _fsync_directory(self.root)

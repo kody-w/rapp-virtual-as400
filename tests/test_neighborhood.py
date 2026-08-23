@@ -433,6 +433,168 @@ class NeighborhoodTests(EngineTestCase):
         self.assertEqual((second_entry["sequence"], third_entry["sequence"]), (2, 3))
         self.assertEqual(len(first.read()), 3)
 
+    def test_append_checks_permissions_before_publication(self) -> None:
+        ledger = neighborhood_module.EvidenceLedger(
+            self.work / "permissions" / "evidence" / "events.jsonl"
+        )
+        original_chmod = os.chmod
+        original_write = os.write
+        writes = 0
+
+        def fail_evidence_chmod(path, mode) -> None:
+            if os.fspath(path) == os.fspath(ledger.path):
+                raise OSError("injected permission failure")
+            original_chmod(path, mode)
+
+        def count_write(descriptor: int, data: bytes) -> int:
+            nonlocal writes
+            writes += 1
+            return original_write(descriptor, data)
+
+        with (
+            mock.patch.object(neighborhood_module.os, "chmod", side_effect=fail_evidence_chmod),
+            mock.patch.object(neighborhood_module.os, "write", side_effect=count_write),
+            self.assertRaisesRegex(OSError, "permission"),
+        ):
+            ledger.append({"type": "never-published"})
+        self.assertEqual(writes, 0)
+        self.assertEqual(ledger.read(), [])
+
+    def test_append_recovers_exact_write_and_fsync_exceptions(self) -> None:
+        for stage in ("write", "fsync"):
+            with self.subTest(stage=stage):
+                ledger = neighborhood_module.EvidenceLedger(
+                    self.work / f"exact-{stage}" / "evidence" / "events.jsonl"
+                )
+                original_write = os.write
+                original_fsync = os.fsync
+                injected = False
+
+                def write_then_raise(descriptor: int, data: bytes) -> int:
+                    nonlocal injected
+                    written = original_write(descriptor, data)
+                    if not injected:
+                        injected = True
+                        raise OSError("injected post-write exception")
+                    return written
+
+                def fsync_then_raise(descriptor: int) -> None:
+                    nonlocal injected
+                    original_fsync(descriptor)
+                    if not injected:
+                        injected = True
+                        raise OSError("injected post-fsync exception")
+
+                patcher = (
+                    mock.patch.object(neighborhood_module.os, "write", side_effect=write_then_raise)
+                    if stage == "write"
+                    else mock.patch.object(
+                        neighborhood_module.os,
+                        "fsync",
+                        side_effect=fsync_then_raise,
+                    )
+                )
+                with ledger.transaction_lock, patcher:
+                    entry = ledger.append({"type": f"exact-{stage}"})
+                self.assertEqual(entry["sequence"], 1)
+                self.assertEqual(ledger.read(), [entry])
+
+    def test_append_ignores_close_failure_after_fsync(self) -> None:
+        ledger = neighborhood_module.EvidenceLedger(
+            self.work / "close" / "evidence" / "events.jsonl"
+        )
+        with mock.patch.object(
+                neighborhood_module.os,
+                "close",
+                side_effect=OSError("injected cosmetic close failure"),
+            ):
+            entry = ledger.append({"type": "close-is-cosmetic"})
+        self.assertEqual(ledger.read(), [entry])
+
+    def test_commit_published_then_exception_is_exact_success_not_failure(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "commit-exact") as neighborhood:
+            original_append = neighborhood.ledger.append
+
+            def publish_then_raise(record: dict) -> dict:
+                entry = original_append(record)
+                if record.get("type") == "replicated_chat_commit":
+                    raise OSError("injected exception after commit publication")
+                return entry
+
+            neighborhood.ledger.append = publish_then_raise  # type: ignore[method-assign]
+            receipt = neighborhood.replicate_chat(
+                "CRTLIB LIB(EXACT)",
+                "exact",
+                "exact",
+            )
+            self.assertTrue(receipt["converged"])
+            entries = neighborhood.ledger.audit()
+            self.assertEqual(
+                [entry["record"]["type"] for entry in entries],
+                ["replicated_chat_intent", "replicated_chat_commit"],
+            )
+            self.assertTrue(neighborhood.topology()["node_count"])
+
+    def test_failure_published_then_exception_is_not_duplicated(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "failure-exact") as neighborhood:
+            second = neighborhood.nodes["AS400-B"]
+            original_request = second.request
+            original_append = neighborhood.ledger.append
+            failed = False
+
+            def fail_node(message: dict) -> dict:
+                nonlocal failed
+                if message.get("kind") == "chat" and not failed:
+                    failed = True
+                    raise Refusal("injected node failure", "NODE_UNAVAILABLE")
+                return original_request(message)
+
+            def publish_then_raise(record: dict) -> dict:
+                entry = original_append(record)
+                if record.get("type") == "replicated_chat_failure":
+                    raise OSError("injected exception after failure publication")
+                return entry
+
+            second.request = fail_node  # type: ignore[method-assign]
+            neighborhood.ledger.append = publish_then_raise  # type: ignore[method-assign]
+            with self.assertRaisesRegex(Refusal, "injected node failure"):
+                neighborhood.replicate_chat("CRTLIB LIB(FAIL)", "fail", "fail")
+            entries = neighborhood.ledger.audit()
+            self.assertEqual(
+                [entry["record"]["type"] for entry in entries],
+                ["replicated_chat_intent", "replicated_chat_failure"],
+            )
+            self.assertTrue(neighborhood.topology()["node_count"])
+
+    def test_partial_commit_append_fails_closed_without_failure_terminal(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "partial-commit") as neighborhood:
+            original_append = neighborhood.ledger.append
+            original_write = os.write
+
+            def partial_then_raise(descriptor: int, data: bytes) -> int:
+                original_write(descriptor, data[:3])
+                raise OSError("injected partial commit")
+
+            def fail_commit(record: dict) -> dict:
+                if record.get("type") == "replicated_chat_commit":
+                    with mock.patch.object(
+                        neighborhood_module.os,
+                        "write",
+                        side_effect=partial_then_raise,
+                    ):
+                        return original_append(record)
+                return original_append(record)
+
+            neighborhood.ledger.append = fail_commit  # type: ignore[method-assign]
+            with self.assertRaises(Refusal) as caught:
+                neighborhood.replicate_chat("CRTLIB LIB(PARTIAL)", "partial", "partial")
+            self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+            with self.assertRaises(Refusal) as blocked:
+                neighborhood.topology()
+            self.assertEqual(blocked.exception.code, "RECOVERY_REQUIRED")
+            with self.assertRaisesRegex(Refusal, "incomplete|invalid"):
+                neighborhood.ledger.audit()
+
     def test_large_snapshot_exists_once_and_bundle_tampering_is_refused(self) -> None:
         root = self.work / "large"
         for node_id in ("AS400-A", "AS400-B"):

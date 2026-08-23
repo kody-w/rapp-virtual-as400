@@ -109,10 +109,14 @@ class PortableRootLock:
                 os.lseek(descriptor, 0, os.SEEK_SET)
                 msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
         finally:
-            os.close(descriptor)
-            del self._local.descriptor
-            self._local.depth = 0
-            self._thread_lock.release()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            finally:
+                del self._local.descriptor
+                self._local.depth = 0
+                self._thread_lock.release()
 
 
 def root_lock(root: Path) -> PortableRootLock:

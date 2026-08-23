@@ -518,6 +518,44 @@ class EvidenceLedger:
             if self._evidence_bytes() + required > MAX_EVIDENCE_BYTES:
                 raise Refusal("Evidence byte limit reached.", "LIMIT_EXCEEDED")
 
+    def _exact_append_is_durable(
+        self,
+        entry: dict,
+        encoded: bytes,
+        original_size: int,
+        synchronized: bool,
+    ) -> bool:
+        if not synchronized:
+            descriptor = -1
+            try:
+                descriptor = os.open(self.path, os.O_RDONLY)
+                os.fsync(descriptor)
+                synchronized = True
+            except OSError:
+                return False
+            finally:
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+        if not synchronized:
+            return False
+        try:
+            sequence, event_hash = self._refresh_tail()
+            if (
+                sequence != entry["sequence"]
+                or event_hash != entry["event_hash"]
+                or self.path.stat().st_size != original_size + len(encoded)
+            ):
+                return False
+            with self.path.open("rb") as handle:
+                handle.seek(original_size)
+                durable = handle.read(len(encoded) + 1)
+            return durable == encoded and json.loads(durable) == entry
+        except (OSError, Refusal, json.JSONDecodeError, UnicodeError):
+            return False
+
     def append(self, record: dict) -> dict:
         if not isinstance(record, dict):
             raise Refusal("Evidence record must be an object.", "INVALID_REQUEST")
@@ -533,26 +571,89 @@ class EvidenceLedger:
                 raise Refusal("Evidence record exceeds its byte limit.", "LIMIT_EXCEEDED")
             if self._evidence_bytes() + len(encoded) > MAX_EVIDENCE_BYTES:
                 raise Refusal("Evidence byte limit reached.", "LIMIT_EXCEEDED")
+            metadata = self.path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise Refusal("Evidence file is unsafe.", "EVIDENCE_INVALID")
+            os.chmod(self.path, 0o600)
+            metadata = self.path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise Refusal("Evidence file permissions are unsafe.", "EVIDENCE_INVALID")
             descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND, 0o600)
             original_size = os.fstat(descriptor).st_size
+            publication_attempted = False
+            synchronized = False
             try:
+                publication_attempted = True
                 written = os.write(descriptor, encoded)
                 if written != len(encoded):
                     raise OSError("Evidence append was incomplete.")
                 os.fsync(descriptor)
-            except Exception:
+                synchronized = True
+            except Exception as error:
                 try:
-                    os.ftruncate(descriptor, original_size)
-                    os.fsync(descriptor)
+                    os.close(descriptor)
                 except OSError:
                     pass
-                raise
-            finally:
+                if publication_attempted and self._exact_append_is_durable(
+                    entry,
+                    encoded,
+                    original_size,
+                    synchronized,
+                ):
+                    self._sequence = sequence
+                    self._previous = entry["event_hash"]
+                    return entry
+                raise Refusal(
+                    "Evidence append outcome is not durably exact.",
+                    "EVIDENCE_INVALID",
+                ) from error
+            try:
                 os.close(descriptor)
-                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
             self._sequence = sequence
             self._previous = entry["event_hash"]
             return entry
+
+    def reserved_terminal(self, intent: dict) -> dict | None:
+        if (
+            not isinstance(intent, dict)
+            or not isinstance(intent.get("sequence"), int)
+            or not isinstance(intent.get("event_hash"), str)
+            or not isinstance(intent.get("record"), dict)
+            or intent["record"].get("type") != "replicated_chat_intent"
+        ):
+            raise Refusal("Reserved terminal intent is invalid.", "EVIDENCE_INVALID")
+        with self.transaction_lock:
+            entries, unmatched = self.recovery_audit()
+            terminal_sequence = intent["record"].get("terminal_sequence")
+            if unmatched:
+                if unmatched != [intent] or entries[-1] != intent:
+                    raise Refusal("Reserved terminal evidence is ambiguous.", "EVIDENCE_INVALID")
+                return None
+            if not isinstance(terminal_sequence, int) or terminal_sequence != intent["sequence"] + 1:
+                raise Refusal("Reserved terminal sequence is invalid.", "EVIDENCE_INVALID")
+            terminal = next(
+                (entry for entry in entries if entry["sequence"] == terminal_sequence),
+                None,
+            )
+            if (
+                terminal is None
+                or terminal["record"].get("type")
+                not in {
+                    "replicated_chat_commit",
+                    "replicated_chat_failure",
+                    "replicated_chat_recovery",
+                }
+                or terminal["record"].get("intent_sequence") != intent["sequence"]
+                or terminal["record"].get("intent_event_hash") != intent["event_hash"]
+                or entries[-1] != terminal
+            ):
+                raise Refusal("Reserved terminal evidence is invalid.", "EVIDENCE_INVALID")
+            return terminal
 
     def write_snapshot_bundle(self, filename: str, bundle: dict) -> dict:
         if BUNDLE_NAME_RE.fullmatch(filename) is None:
@@ -861,10 +962,18 @@ class PrivateVNetNeighborhood:
         try:
             terminal = self.ledger.append(recovery_record)
         except Exception as error:
-            raise Refusal(
-                f"Recovery terminal evidence append failed ({type(error).__name__}).",
-                "RECOVERY_FAILED",
-            ) from error
+            try:
+                terminal = self.ledger.reserved_terminal(intent)
+            except Exception as verification_error:
+                raise Refusal(
+                    "Recovery terminal evidence is ambiguous or invalid.",
+                    "RECOVERY_FAILED",
+                ) from verification_error
+            if terminal is None or terminal["record"] != recovery_record:
+                raise Refusal(
+                    f"Recovery terminal evidence append failed ({type(error).__name__}).",
+                    "RECOVERY_FAILED",
+                ) from error
         if terminal["sequence"] != record["terminal_sequence"]:
             raise Refusal("Recovery did not use its reserved terminal slot.", "RECOVERY_FAILED")
         self.ledger.audit()
@@ -1054,31 +1163,53 @@ class PrivateVNetNeighborhood:
                     "EVIDENCE_IO_FAILED",
                 ) from error
 
-            try:
-                intent = self.ledger.append(
-                    {
-                        "type": "replicated_chat_intent",
-                        "message": message,
-                        "nodes": list(self.nodes),
-                        "snapshot_bundle_path": bundle_reference["path"],
-                        "snapshot_bundle": bundle_reference,
-                        "pre_state_hashes": pre_state_hashes,
-                        "terminal_sequence": sequence + 1,
-                    }
-                )
-            except Exception as error:
-                raise Refusal(
-                    f"Intent evidence append failed ({type(error).__name__}).",
-                    "EVIDENCE_IO_FAILED",
-                ) from error
+            intent_record = {
+                "type": "replicated_chat_intent",
+                "message": message,
+                "nodes": list(self.nodes),
+                "snapshot_bundle_path": bundle_reference["path"],
+                "snapshot_bundle": bundle_reference,
+                "pre_state_hashes": pre_state_hashes,
+                "terminal_sequence": sequence + 1,
+            }
             self._operable = False
+            try:
+                intent = self.ledger.append(intent_record)
+            except Exception as error:
+                try:
+                    entries, unmatched = self.ledger.recovery_audit()
+                except Exception as verification_error:
+                    raise Refusal(
+                        "Intent evidence is ambiguous or invalid.",
+                        "RECOVERY_REQUIRED",
+                    ) from verification_error
+                if (
+                    len(unmatched) == 1
+                    and unmatched[0]["sequence"] == sequence
+                    and unmatched[0]["record"] == intent_record
+                ):
+                    intent = unmatched[0]
+                elif not unmatched and all(entry["sequence"] < sequence for entry in entries):
+                    self._operable = True
+                    raise Refusal(
+                        f"Intent evidence append failed ({type(error).__name__}).",
+                        "EVIDENCE_IO_FAILED",
+                    ) from error
+                else:
+                    raise Refusal(
+                        "Intent evidence outcome could not be proven.",
+                        "RECOVERY_REQUIRED",
+                    ) from error
             intent_link = {
                 "intent_sequence": intent["sequence"],
                 "intent_event_hash": intent["event_hash"],
             }
             mutation_started = False
+            results: dict[str, dict] = {}
+            state_hashes: dict[str, str] = {}
+            entry: dict | None = None
+            operation_error: Exception | None = None
             try:
-                results: dict[str, dict] = {}
                 mutation_started = True
                 for node_id, node in self.nodes.items():
                     results[node_id] = self._checked_response(node_id, node.request(message))
@@ -1090,83 +1221,160 @@ class PrivateVNetNeighborhood:
                 }
                 if len(set(state_hashes.values())) != 1:
                     raise Refusal("Replicated node states diverged.", "REPLICATION_DIVERGED")
-                try:
-                    entry = self.ledger.append(
-                        {
-                            "type": "replicated_chat_commit",
-                            **intent_link,
-                            "message": message,
-                            "snapshot_bundle": bundle_reference,
-                            "pre_state_hashes": pre_state_hashes,
-                            "results": results,
-                            "state_hashes": state_hashes,
-                            "restore": {
-                                "status": "not_required",
-                                "state_hashes": {},
-                                "failures": [],
-                            },
-                            "converged": True,
-                        }
-                    )
-                    self._operable = True
-                except Exception as error:
-                    raise Refusal(
-                        f"Terminal evidence append failed ({type(error).__name__}).",
-                        "EVIDENCE_IO_FAILED",
-                    ) from error
             except Exception as error:
+                operation_error = error
+
+            commit_record: dict | None = None
+            if operation_error is None:
+                commit_record = {
+                    "type": "replicated_chat_commit",
+                    **intent_link,
+                    "message": message,
+                    "snapshot_bundle": bundle_reference,
+                    "pre_state_hashes": pre_state_hashes,
+                    "results": results,
+                    "state_hashes": state_hashes,
+                    "restore": {
+                        "status": "not_required",
+                        "state_hashes": {},
+                        "failures": [],
+                    },
+                    "converged": True,
+                }
+                try:
+                    entry = self.ledger.append(commit_record)
+                except Exception as error:
+                    try:
+                        occupied = self.ledger.reserved_terminal(intent)
+                    except Exception as verification_error:
+                        self._operable = False
+                        raise Refusal(
+                            "Terminal evidence is ambiguous or invalid.",
+                            "RECOVERY_REQUIRED",
+                        ) from verification_error
+                    if occupied is not None:
+                        if occupied["record"] != commit_record:
+                            self._operable = False
+                            raise Refusal(
+                                "Reserved terminal slot was consumed by a different outcome.",
+                                "RECOVERY_REQUIRED",
+                            ) from error
+                        entry = occupied
+                    else:
+                        operation_error = Refusal(
+                            f"Terminal evidence append failed ({type(error).__name__}).",
+                            "EVIDENCE_IO_FAILED",
+                        )
+
+            if operation_error is not None:
+                try:
+                    occupied = self.ledger.reserved_terminal(intent)
+                except Exception as verification_error:
+                    self._operable = False
+                    raise Refusal(
+                        "Terminal evidence is ambiguous or invalid.",
+                        "RECOVERY_REQUIRED",
+                    ) from verification_error
+                if occupied is not None:
+                    if commit_record is not None and occupied["record"] == commit_record:
+                        entry = occupied
+                        operation_error = None
+                    else:
+                        self._operable = False
+                        raise Refusal(
+                            "Reserved terminal slot was already consumed.",
+                            "RECOVERY_REQUIRED",
+                        ) from operation_error
+
+            if operation_error is not None:
                 restored_hashes: dict[str, str] = {}
                 rollback_failures: list[str] = []
                 if mutation_started and len(pre_snapshots) == len(self.nodes):
                     restored_hashes, rollback_failures = self._restore_and_verify(pre_snapshots)
+                failure_record = {
+                    "type": "replicated_chat_failure",
+                    **intent_link,
+                    "message": message,
+                    "failure": self._failure_details(operation_error),
+                    "snapshot_bundle": bundle_reference,
+                    "pre_state_hashes": pre_state_hashes,
+                    "rollback_required": mutation_started,
+                    "restored_state_hashes": restored_hashes,
+                    "rollback_verified": not mutation_started or not rollback_failures,
+                    "rollback_failures": rollback_failures,
+                    "restore": {
+                        "status": (
+                            "not_required"
+                            if not mutation_started
+                            else "verified"
+                            if not rollback_failures
+                            else "failed"
+                        ),
+                        "state_hashes": restored_hashes,
+                        "failures": rollback_failures,
+                    },
+                }
                 terminal_recorded = False
                 try:
-                    self.ledger.append(
-                        {
-                            "type": "replicated_chat_failure",
-                            **intent_link,
-                            "message": message,
-                            "failure": self._failure_details(error),
-                            "snapshot_bundle": bundle_reference,
-                            "pre_state_hashes": pre_state_hashes,
-                            "rollback_required": mutation_started,
-                            "restored_state_hashes": restored_hashes,
-                            "rollback_verified": not mutation_started or not rollback_failures,
-                            "rollback_failures": rollback_failures,
-                            "restore": {
-                                "status": (
-                                    "not_required"
-                                    if not mutation_started
-                                    else "verified"
-                                    if not rollback_failures
-                                    else "failed"
-                                ),
-                                "state_hashes": restored_hashes,
-                                "failures": rollback_failures,
-                            },
-                        }
-                    )
+                    self.ledger.append(failure_record)
                     terminal_recorded = True
-                except Exception:
-                    self._operable = False
+                except Exception as terminal_error:
+                    try:
+                        occupied = self.ledger.reserved_terminal(intent)
+                    except Exception as verification_error:
+                        self._operable = False
+                        raise Refusal(
+                            "Failure terminal evidence is ambiguous or invalid.",
+                            "RECOVERY_REQUIRED",
+                        ) from verification_error
+                    if occupied is not None and occupied["record"] == failure_record:
+                        terminal_recorded = True
+                    elif occupied is not None:
+                        self._operable = False
+                        raise Refusal(
+                            "Reserved terminal slot was consumed by a different outcome.",
+                            "RECOVERY_REQUIRED",
+                        ) from terminal_error
                 if rollback_failures:
                     self._operable = False
                     raise Refusal(
                         "Replicated chat rollback could not be verified for every node.",
                         "ROLLBACK_FAILED",
-                    ) from error
+                    ) from operation_error
                 if not terminal_recorded:
+                    self._operable = False
                     raise Refusal(
                         "Replicated chat is closed pending durable recovery.",
                         "RECOVERY_REQUIRED",
-                    ) from error
+                    ) from operation_error
+                try:
+                    self.ledger.audit()
+                except Exception as audit_error:
+                    self._operable = False
+                    raise Refusal(
+                        "Failure terminal evidence did not pass audit.",
+                        "RECOVERY_REQUIRED",
+                    ) from audit_error
                 self._operable = True
-                if isinstance(error, Refusal):
-                    raise
+                if isinstance(operation_error, Refusal):
+                    raise operation_error
                 raise Refusal(
-                    f"Replicated chat failed ({type(error).__name__}).",
+                    f"Replicated chat failed ({type(operation_error).__name__}).",
                     "NODE_FAILED",
-                ) from error
+                ) from operation_error
+
+            if entry is None:
+                self._operable = False
+                raise Refusal("Commit evidence is missing.", "RECOVERY_REQUIRED")
+            try:
+                self.ledger.audit()
+            except Exception as audit_error:
+                self._operable = False
+                raise Refusal(
+                    "Commit evidence did not pass audit.",
+                    "RECOVERY_REQUIRED",
+                ) from audit_error
+            self._operable = True
             return {
                 "protocol": "RAPP/1",
                 "control": "replicate_chat",
@@ -1301,19 +1509,26 @@ class PrivateVNetNeighborhood:
                     "REPLICATION_DIVERGED",
                 )
             outliers = [item for item in attempts if item["outcome"] != expected_outcome]
-            entry = self.ledger.append(
-                {
-                    "type": "replicated_run",
-                    "job": job,
-                    "mode": mode,
-                    "replicas": replicas,
-                    "predeclared_quorum": quorum,
-                    "expected_outcome": expected_outcome,
-                    "attempts": attempts,
-                    "outliers": outliers,
-                    "accepted": True,
-                }
-            )
+            try:
+                entry = self.ledger.append(
+                    {
+                        "type": "replicated_run",
+                        "job": job,
+                        "mode": mode,
+                        "replicas": replicas,
+                        "predeclared_quorum": quorum,
+                        "expected_outcome": expected_outcome,
+                        "attempts": attempts,
+                        "outliers": outliers,
+                        "accepted": True,
+                    }
+                )
+            except Exception as error:
+                self._operable = False
+                raise Refusal(
+                    "Replicated run evidence is ambiguous; recovery is required.",
+                    "RECOVERY_REQUIRED",
+                ) from error
         return {
             "protocol": "RAPP/1",
             "control": "replicated_run",

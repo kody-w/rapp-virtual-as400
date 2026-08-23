@@ -107,8 +107,15 @@ requires byte-canonical state convergence with its peers. A failed replay
 restores the selected node's exact pre-replay state.
 
 Normal appends refresh sequence and hash from one bounded tail read instead of
-parsing all historical JSONL. Full `read()`/`audit()` still validates every
-sequence and hash link.
+parsing all historical JSONL. Permissions and byte/event capacity are checked
+before publication. If write or flush reports an error after publication may
+have begun, the ledger flushes again and accepts success only when a bounded
+tail refresh proves the exact expected sequence, hash, record, and file size.
+Close errors after that proof are cosmetic. Replication inspects the reserved
+terminal before recording failure, so a durably published commit cannot gain
+a second failure terminal. Any partial, mismatched, or otherwise ambiguous
+tail keeps the live neighborhood in recovery-required fail-closed state. Full
+`read()`/`audit()` still validates every sequence and hash link.
 
 `run_replicated_job()` runs 1–100 bounded simulations across the node
 processes:

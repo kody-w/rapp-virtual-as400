@@ -324,13 +324,13 @@ MUTATIONS = [
         "bundle-only-terminal-record",
         "neighborhood.py",
         (
-            '                            "pre_state_hashes": pre_state_hashes,\n'
-            '                            "results": results,'
+            '                    "pre_state_hashes": pre_state_hashes,\n'
+            '                    "results": results,'
         ),
         (
-            '                            "pre_snapshots": pre_snapshots,\n'
-            '                            "pre_state_hashes": pre_state_hashes,\n'
-            '                            "results": results,'
+            '                    "pre_snapshots": pre_snapshots,\n'
+            '                    "pre_state_hashes": pre_state_hashes,\n'
+            '                    "results": results,'
         ),
         (
             "from pathlib import Path\n"
@@ -369,6 +369,108 @@ MUTATIONS = [
             "a.append({'type':'one'}); b.append({'type':'two'})\n"
             "entries=a.read()\n"
             "raise SystemExit(0 if [e['sequence'] for e in entries]==[1,2] else 1)\n"
+        ),
+    ),
+    Mutation(
+        "append-permission-preflight",
+        "neighborhood.py",
+        "            os.chmod(self.path, 0o600)\n            metadata = self.path.lstat()",
+        "            metadata = self.path.lstat()",
+        (
+            "from pathlib import Path\n"
+            "import os\n"
+            "from rapp_virtual_as400.neighborhood import EvidenceLedger\n"
+            "ledger=EvidenceLedger(Path('evidence/events.jsonl')); os.chmod(ledger.path,0o644)\n"
+            "entry=ledger.append({'type':'private'})\n"
+            "raise SystemExit(0 if entry['sequence']==1 and (ledger.path.stat().st_mode & 0o777)==0o600 else 1)\n"
+        ),
+    ),
+    Mutation(
+        "append-post-fsync-close",
+        "neighborhood.py",
+        (
+            "            try:\n"
+            "                os.close(descriptor)\n"
+            "            except OSError:\n"
+            "                pass\n"
+            "            self._sequence = sequence"
+        ),
+        (
+            "            os.close(descriptor)\n"
+            "            self._sequence = sequence"
+        ),
+        (
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "import rapp_virtual_as400.neighborhood as m\n"
+            "ledger=m.EvidenceLedger(Path('evidence/events.jsonl'))\n"
+            "with ledger.transaction_lock, mock.patch.object(m.os,'close',side_effect=OSError('close')):\n"
+            " entry=ledger.append({'type':'durable'})\n"
+            "raise SystemExit(0 if entry['sequence']==1 and len(ledger.read())==1 else 1)\n"
+        ),
+    ),
+    Mutation(
+        "append-exact-durable-recovery",
+        "neighborhood.py",
+        "                if publication_attempted and self._exact_append_is_durable(",
+        "                if False and self._exact_append_is_durable(",
+        (
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "import os\n"
+            "import rapp_virtual_as400.neighborhood as m\n"
+            "ledger=m.EvidenceLedger(Path('evidence/events.jsonl')); original=os.write; injected=[False]\n"
+            "def write_then_raise(fd,data):\n"
+            " written=original(fd,data)\n"
+            " if not injected[0]: injected[0]=True; raise OSError('after write')\n"
+            " return written\n"
+            "with ledger.transaction_lock, mock.patch.object(m.os,'write',side_effect=write_then_raise):\n"
+            " entry=ledger.append({'type':'exact'})\n"
+            "raise SystemExit(0 if entry['sequence']==1 and len(ledger.read())==1 else 1)\n"
+        ),
+    ),
+    Mutation(
+        "reserved-terminal-detection",
+        "neighborhood.py",
+        "            return terminal\n\n    def write_snapshot_bundle",
+        "            return None\n\n    def write_snapshot_bundle",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " original=n.ledger.append\n"
+            " def publish_then_raise(record):\n"
+            "  entry=original(record)\n"
+            "  if record.get('type')=='replicated_chat_commit': raise OSError('after commit')\n"
+            "  return entry\n"
+            " n.ledger.append=publish_then_raise\n"
+            " result=n.replicate_chat('CRTLIB LIB(EXACT)','exact','exact')\n"
+            " types=[entry['record']['type'] for entry in n.ledger.audit()]\n"
+            " raise SystemExit(0 if result['converged'] and types==['replicated_chat_intent','replicated_chat_commit'] else 1)\n"
+        ),
+    ),
+    Mutation(
+        "failure-terminal-exact-detection",
+        "neighborhood.py",
+        '                    if occupied is not None and occupied["record"] == failure_record:',
+        "                    if False:",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import PrivateVNetNeighborhood,Refusal\n"
+            "with PrivateVNetNeighborhood(Path('vnet')) as n:\n"
+            " node=n.nodes['AS400-B']; request=node.request; append=n.ledger.append; failed=[False]\n"
+            " def fail(message):\n"
+            "  if message.get('kind')=='chat' and not failed[0]: failed[0]=True; raise Refusal('node','NODE_UNAVAILABLE')\n"
+            "  return request(message)\n"
+            " def publish_then_raise(record):\n"
+            "  entry=append(record)\n"
+            "  if record.get('type')=='replicated_chat_failure': raise OSError('after failure')\n"
+            "  return entry\n"
+            " node.request=fail; n.ledger.append=publish_then_raise\n"
+            " try: n.replicate_chat('CRTLIB LIB(FAIL)','fail','fail')\n"
+            " except Refusal: pass\n"
+            " types=[entry['record']['type'] for entry in n.ledger.audit()]\n"
+            " raise SystemExit(0 if types==['replicated_chat_intent','replicated_chat_failure'] and n.topology()['node_count']==2 else 1)\n"
         ),
     ),
     Mutation(
@@ -505,9 +607,10 @@ MUTATIONS = [
             "from pathlib import Path\n"
             "from unittest import mock\n"
             "import rapp_virtual_as400.storage as m\n"
+            "path=Path('.')\n"
             "with mock.patch.object(m.os,'name','nt'), "
             "mock.patch.object(m.os,'open',side_effect=AssertionError('directory opened')):\n"
-            " m.fsync_directory(Path('.'))\n"
+            " m.fsync_directory(path)\n"
         ),
     ),
 ]

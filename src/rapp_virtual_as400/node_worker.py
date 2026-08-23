@@ -86,7 +86,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
     args = parser.parse_args(argv)
-    engine = VirtualAS400(args.root.expanduser().resolve() / "state.json")
+    engine: VirtualAS400 | None = None
+    storage_error: Refusal | None = None
+    try:
+        engine = VirtualAS400(args.root.expanduser().resolve() / "state.json")
+    except Refusal as error:
+        if error.code != "RECOVERY_REQUIRED":
+            raise
+        storage_error = error
     for line in sys.stdin:
         stop = False
         session_id = ""
@@ -104,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise Refusal("Worker message exceeds 8192 bytes.", "LIMIT_EXCEEDED")
             if isinstance(message, dict) and isinstance(message.get("session_id"), str):
                 session_id = message["session_id"]
+            if storage_error is not None:
+                raise storage_error
+            if engine is None:
+                raise Refusal(
+                    "State recovery is required before this store can accept requests.",
+                    "RECOVERY_REQUIRED",
+                )
             response, stop = _handle(engine, message)
         except (json.JSONDecodeError, UnicodeError):
             response = Refusal("Worker message must be valid JSON.", "INVALID_REQUEST").envelope("")

@@ -4,9 +4,16 @@ import json
 import threading
 import urllib.error
 import urllib.request
+from unittest import mock
 
+from rapp_virtual_as400 import Refusal
 from rapp_virtual_as400.server import RAPPServer
-from rapp_virtual_as400.storage import MAX_PERSISTED_STATE_BYTES, empty_state
+from rapp_virtual_as400.storage import (
+    MAX_PERSISTED_STATE_BYTES,
+    AtomicStore,
+    RECOVERY_REQUIRED_MESSAGE,
+    empty_state,
+)
 
 from .support import EngineTestCase
 
@@ -86,6 +93,71 @@ class ServerE2ETests(EngineTestCase):
         self.assertEqual(body["error"]["type"], "refusal")
         self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
         self.assertEqual(body["agent_logs"], [])
+
+    def test_storage_publication_failure_is_stable_http_refusal(self) -> None:
+        failure = Refusal(
+            "State publication failed; the prior state remains active.",
+            "STORAGE_PUBLICATION_FAILED",
+        )
+        assert self.server.engine is not None
+        with mock.patch.object(self.server.engine.store, "_write", side_effect=failure):
+            status, body = self.request(
+                "/chat",
+                {
+                    "user_input": "CRTLIB LIB(FAIL)",
+                    "session_id": "storage",
+                    "idempotency_key": "once",
+                },
+            )
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "STORAGE_PUBLICATION_FAILED")
+        self.assertEqual(body["session_id"], "storage")
+
+    def test_recovery_required_restart_serves_degraded_stable_refusal(self) -> None:
+        state_path = self.work / "degraded-state.json"
+        store = AtomicStore(state_path)
+        old = state_path.read_bytes()
+        new_state = empty_state()
+        new_state["revision"] = 1
+        new = json.dumps(
+            new_state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        prepared = store._journal_bytes("prepared", old, new, True)
+        store._publish_file(store.recovery_path, prepared)
+        state_path.write_bytes(b"neither-old-nor-new")
+
+        degraded = RAPPServer(
+            ("127.0.0.1", 0),
+            state_path,
+            self.work / "degraded-stop.capability",
+        )
+        thread = threading.Thread(target=degraded.serve_forever, daemon=True)
+        thread.start()
+        base = self.base
+        self.base = f"http://127.0.0.1:{degraded.server_port}"
+        try:
+            status, health = self.request("/health")
+            self.assertEqual(status, 200)
+            self.assertEqual(health["status"], "degraded")
+            self.assertEqual(health["storage_error"], "RECOVERY_REQUIRED")
+            status, body = self.request(
+                "/chat",
+                {"user_input": "DSPLIB", "session_id": "restart"},
+            )
+            self.assertEqual(status, 422)
+            self.assertEqual(body["error"]["code"], "RECOVERY_REQUIRED")
+            self.assertEqual(
+                body["error"]["message"],
+                RECOVERY_REQUIRED_MESSAGE,
+            )
+        finally:
+            degraded.shutdown()
+            degraded.server_close()
+            thread.join(timeout=2)
+            self.base = base
 
     def test_decimal_precision_28_29_and_38_through_live_chat(self) -> None:
         values = {

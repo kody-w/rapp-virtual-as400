@@ -24,7 +24,14 @@ class RAPPServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], state_path: str | Path, capability_path: str | Path) -> None:
         super().__init__(address, RAPPHandler)
-        self.engine = VirtualAS400(state_path)
+        self.engine: VirtualAS400 | None = None
+        self.storage_error: Refusal | None = None
+        try:
+            self.engine = VirtualAS400(state_path)
+        except Refusal as error:
+            if error.code != "RECOVERY_REQUIRED":
+                raise
+            self.storage_error = error
         self.stop_capability = secrets.token_urlsafe(32)
         capability = Path(capability_path).expanduser().resolve()
         capability.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -77,13 +84,19 @@ class RAPPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
+            storage_error = self.server.storage_error
             self._json(
                 HTTPStatus.OK,
                 {
-                    "status": "ok",
+                    "status": "degraded" if storage_error else "ok",
                     "service": "rapp-virtual-as400",
                     "version": __version__,
                     "protocol": "RAPP/1",
+                    **(
+                        {"storage_error": storage_error.code}
+                        if storage_error is not None
+                        else {}
+                    ),
                 },
             )
             return
@@ -132,6 +145,13 @@ class RAPPHandler(BaseHTTPRequestHandler):
             session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
             if "user_input" not in payload:
                 raise Refusal("user_input is required.", "INVALID_REQUEST")
+            if self.server.storage_error is not None:
+                raise self.server.storage_error
+            if self.server.engine is None:
+                raise Refusal(
+                    "State recovery is required before this store can accept requests.",
+                    "RECOVERY_REQUIRED",
+                )
             result = self.server.engine.chat(
                 payload["user_input"],
                 payload.get("session_id"),

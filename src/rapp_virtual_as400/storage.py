@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
 import os
 import re
@@ -29,11 +31,17 @@ except ImportError:  # pragma: no cover - POSIX
 
 MAX_PERSISTED_STATE_BYTES = 4 * 1024 * 1024
 MAX_RESTORE_SNAPSHOT_BYTES = MAX_PERSISTED_STATE_BYTES
+MAX_RECOVERY_JOURNAL_BYTES = 12 * 1024 * 1024
 MAX_SNAPSHOT_DEPTH = 32
 MAX_SIX_DIGIT_ID = 999_999
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[Path, "PortableRootLock"] = {}
+
+PUBLICATION_FAILED_MESSAGE = "State publication failed; the prior state remains active."
+RECOVERY_REQUIRED_MESSAGE = (
+    "State recovery is required before this store can accept requests."
+)
 
 
 def enforce_private_mode(path: str | os.PathLike[str], mode: int) -> None:
@@ -210,16 +218,23 @@ def _serialized_state_bytes(state: object) -> bytes:
 
 
 class AtomicStore:
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        recover: bool = False,
+    ) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         enforce_private_mode(self.path.parent, 0o700)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self.recovery_path = self.path.with_suffix(self.path.suffix + ".recovery")
         self._thread_lock = threading.RLock()
         lock_descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         os.close(lock_descriptor)
         enforce_private_mode(self.lock_path, 0o600)
         with root_lock(self.path.parent):
+            self._recover_if_needed(force_prior=recover)
             if not self.path.exists():
                 self._write(empty_state())
             else:
@@ -232,23 +247,281 @@ class AtomicStore:
         with self.path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 
-    def _write(self, state: dict) -> None:
-        encoded = _serialized_state_bytes(state)
-        temp = self.path.with_suffix(self.path.suffix + ".new")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        descriptor = os.open(temp, flags, 0o600)
+    @staticmethod
+    def _hash(value: bytes) -> str:
+        return hashlib.sha256(value).hexdigest()
+
+    @staticmethod
+    def _revision(value: bytes) -> int | None:
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, UnicodeError):
+            return None
+        revision = decoded.get("revision") if isinstance(decoded, dict) else None
+        return revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+
+    def _journal_bytes(
+        self,
+        phase: str,
+        old: bytes,
+        new: bytes,
+        old_exists: bool,
+    ) -> bytes:
+        journal = {
+            "format": 1,
+            "phase": phase,
+            "old_exists": old_exists,
+            "old_hash": self._hash(old),
+            "new_hash": self._hash(new),
+            "old_revision": self._revision(old) if old_exists else None,
+            "new_revision": self._revision(new),
+            "old_bytes": base64.b64encode(old).decode("ascii"),
+            "new_bytes": base64.b64encode(new).decode("ascii"),
+        }
+        encoded = json.dumps(
+            journal,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        if len(encoded) > MAX_RECOVERY_JOURNAL_BYTES:
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED")
+        return encoded
+
+    def _load_journal(self) -> dict:
+        try:
+            metadata = self.recovery_path.stat()
+            if metadata.st_size > MAX_RECOVERY_JOURNAL_BYTES:
+                raise ValueError("oversized recovery journal")
+            if private_mode_mismatch(metadata.st_mode, 0o600):
+                raise ValueError("non-private recovery journal")
+            encoded = self.recovery_path.read_bytes()
+            if len(encoded) > MAX_RECOVERY_JOURNAL_BYTES:
+                raise ValueError("oversized recovery journal")
+            journal = json.loads(encoded)
+            expected = {
+                "format",
+                "phase",
+                "old_exists",
+                "old_hash",
+                "new_hash",
+                "old_revision",
+                "new_revision",
+                "old_bytes",
+                "new_bytes",
+            }
+            if (
+                not isinstance(journal, dict)
+                or set(journal) != expected
+                or journal["format"] != 1
+                or journal["phase"] not in {"prepared", "committed"}
+                or not isinstance(journal["old_exists"], bool)
+                or not isinstance(journal["old_bytes"], str)
+                or not isinstance(journal["new_bytes"], str)
+                or (
+                    not journal["old_exists"]
+                    and journal["old_revision"] is not None
+                )
+                or any(
+                    not isinstance(journal[key], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", journal[key]) is None
+                    for key in ("old_hash", "new_hash")
+                )
+                or any(
+                    value is not None
+                    and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+                    for value in (journal["old_revision"], journal["new_revision"])
+                )
+            ):
+                raise ValueError("invalid recovery journal")
+            old = base64.b64decode(journal["old_bytes"], validate=True)
+            new = base64.b64decode(journal["new_bytes"], validate=True)
+            if (
+                self._hash(old) != journal["old_hash"]
+                or self._hash(new) != journal["new_hash"]
+                or (not journal["old_exists"] and old != b"")
+                or (
+                    journal["old_exists"]
+                    and self._revision(old) != journal["old_revision"]
+                )
+                or self._revision(new) != journal["new_revision"]
+            ):
+                raise ValueError("invalid recovery journal payload")
+            journal["decoded_old_bytes"] = old
+            journal["decoded_new_bytes"] = new
+            return journal
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+
+    def _publish_file(self, destination: Path, encoded: bytes) -> None:
+        temp = destination.with_suffix(destination.suffix + ".new")
+        descriptor = os.open(
+            temp,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             enforce_private_mode(temp, 0o600)
-            os.replace(temp, self.path)
-            enforce_private_mode(self.path, 0o600)
-            fsync_directory(self.path.parent)
+            os.replace(temp, destination)
+            fsync_directory(destination.parent)
+            actual = destination.read_bytes()
+            if actual != encoded or self._hash(actual) != self._hash(encoded):
+                raise OSError("atomic publication verification failed")
         finally:
             if temp.exists():
                 temp.unlink()
+
+    def _remove_journal(self) -> None:
+        try:
+            self.recovery_path.unlink()
+        except FileNotFoundError:
+            return
+        fsync_directory(self.path.parent)
+
+    def _restore_prior(self, old: bytes, old_exists: bool) -> bool:
+        try:
+            if old_exists:
+                self._publish_file(self.path, old)
+            else:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                fsync_directory(self.path.parent)
+            if old_exists:
+                return (
+                    self.path.exists()
+                    and self.path.read_bytes() == old
+                    and self._hash(self.path.read_bytes()) == self._hash(old)
+                )
+            return not self.path.exists()
+        except OSError:
+            try:
+                if old_exists and self.path.exists() and self.path.read_bytes() == old:
+                    fsync_directory(self.path.parent)
+                    return self.path.read_bytes() == old
+                if not old_exists and not self.path.exists():
+                    fsync_directory(self.path.parent)
+                    return not self.path.exists()
+            except OSError:
+                pass
+            return False
+
+    def _recover_if_needed(self, *, force_prior: bool = False) -> None:
+        try:
+            self.recovery_path.stat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+        journal = self._load_journal()
+        old = journal["decoded_old_bytes"]
+        new = journal["decoded_new_bytes"]
+        old_exists = journal["old_exists"]
+        try:
+            current = self.path.read_bytes() if self.path.exists() else None
+        except OSError:
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+        old_matches = current == old if old_exists else current is None
+        new_matches = current == new
+
+        if force_prior:
+            if not self._restore_prior(old, old_exists):
+                raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED")
+        elif journal["phase"] == "prepared":
+            if new_matches:
+                if not self._restore_prior(old, old_exists):
+                    raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED")
+            elif not old_matches:
+                raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED")
+        elif not (new_matches or old_matches):
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED")
+
+        try:
+            self._remove_journal()
+        except OSError:
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+
+    def _write(self, state: dict) -> None:
+        encoded = _serialized_state_bytes(state)
+        self._recover_if_needed()
+        try:
+            self.path.stat()
+            old_exists = True
+        except FileNotFoundError:
+            old_exists = False
+        except OSError:
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+        try:
+            old = self.path.read_bytes() if old_exists else b""
+        except OSError:
+            raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+        prepared = self._journal_bytes("prepared", old, encoded, old_exists)
+        committed = self._journal_bytes("committed", old, encoded, old_exists)
+        try:
+            self._publish_file(self.recovery_path, prepared)
+        except OSError:
+            raise Refusal(PUBLICATION_FAILED_MESSAGE, "STORAGE_PUBLICATION_FAILED") from None
+
+        try:
+            self._publish_file(self.path, encoded)
+        except OSError:
+            try:
+                current = self.path.read_bytes() if self.path.exists() else None
+            except OSError:
+                current = None
+            old_matches = current == old if old_exists else current is None
+            new_matches = current == encoded
+            if new_matches and not self._restore_prior(old, old_exists):
+                raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+            if not old_matches and not new_matches:
+                raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+            try:
+                self._remove_journal()
+            except OSError:
+                pass
+            raise Refusal(
+                PUBLICATION_FAILED_MESSAGE,
+                "STORAGE_PUBLICATION_FAILED",
+            ) from None
+
+        try:
+            self._publish_file(self.recovery_path, committed)
+        except OSError:
+            try:
+                durable_commit = (
+                    self.recovery_path.read_bytes() == committed
+                    and self.path.read_bytes() == encoded
+                )
+                if durable_commit:
+                    fsync_directory(self.path.parent)
+            except OSError:
+                durable_commit = False
+            if not durable_commit:
+                if not self._restore_prior(old, old_exists):
+                    raise Refusal(RECOVERY_REQUIRED_MESSAGE, "RECOVERY_REQUIRED") from None
+                try:
+                    self._remove_journal()
+                except OSError:
+                    pass
+                raise Refusal(
+                    PUBLICATION_FAILED_MESSAGE,
+                    "STORAGE_PUBLICATION_FAILED",
+                ) from None
+
+        try:
+            self._remove_journal()
+        except OSError:
+            pass
+
+    def recover(self) -> None:
+        """Explicitly restore the exact pre-publication state from the journal."""
+        with self._thread_lock, root_lock(self.path.parent):
+            self._recover_if_needed(force_prior=True)
 
     @staticmethod
     def validate_snapshot(snapshot: object) -> dict:
@@ -612,6 +885,7 @@ class AtomicStore:
     def transaction(self) -> Iterator[dict]:
         with self._thread_lock:
             with root_lock(self.path.parent):
+                self._recover_if_needed()
                 original = self._read()
                 working = copy.deepcopy(original)
                 yield working
@@ -620,13 +894,16 @@ class AtomicStore:
 
     def snapshot(self) -> dict:
         with self._thread_lock, root_lock(self.path.parent):
+            self._recover_if_needed()
             return copy.deepcopy(self._read())
 
     def restore(self, snapshot: object) -> None:
         restored = self.validate_snapshot(snapshot)
         with self._thread_lock, root_lock(self.path.parent):
+            self._recover_if_needed()
             self._write(restored)
 
     def reset(self) -> None:
         with self._thread_lock, root_lock(self.path.parent):
+            self._recover_if_needed()
             self._write(empty_state())

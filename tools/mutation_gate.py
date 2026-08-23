@@ -687,6 +687,87 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "state-permissions-before-publication",
+        "storage.py",
+        (
+            "            enforce_private_mode(temp, 0o600)\n"
+            "            os.replace(temp, destination)"
+        ),
+        (
+            "            os.replace(temp, destination)\n"
+            "            enforce_private_mode(destination, 0o600)"
+        ),
+        (
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "import os\n"
+            "import rapp_virtual_as400.storage as m\n"
+            "s=m.AtomicStore(Path('state.json')); state=m.empty_state(); state['revision']=1\n"
+            "events=[]; real_enforce=m.enforce_private_mode; real_replace=os.replace\n"
+            "def enforce(path,mode):\n"
+            " if Path(path) in {s.path,s.path.with_suffix(s.path.suffix+'.new')}: "
+            "events.append(('chmod',Path(path)))\n"
+            " return real_enforce(path,mode)\n"
+            "def replace(source,destination):\n"
+            " if Path(destination)==s.path: events.append(('replace',Path(destination)))\n"
+            " return real_replace(source,destination)\n"
+            "with mock.patch.object(m,'enforce_private_mode',side_effect=enforce),"
+            "mock.patch.object(m.os,'replace',side_effect=replace): s._write(state)\n"
+            "raise SystemExit(0 if events==[('chmod',s.path.with_suffix(s.path.suffix+'.new')),"
+            "('replace',s.path)] else 1)\n"
+        ),
+    ),
+    Mutation(
+        "published-byte-verification",
+        "storage.py",
+        (
+            "            if actual != encoded or self._hash(actual) != self._hash(encoded):"
+        ),
+        "            if False:",
+        (
+            "from pathlib import Path\n"
+            "from unittest import mock\n"
+            "import os\n"
+            "import rapp_virtual_as400.storage as m\n"
+            "from rapp_virtual_as400 import Refusal\n"
+            "s=m.AtomicStore(Path('state.json')); state=m.empty_state(); state['revision']=1\n"
+            "real_replace=os.replace\n"
+            "def corrupt(source,destination):\n"
+            " real_replace(source,destination)\n"
+            " if Path(destination)==s.path: s.path.write_bytes(b'corrupt')\n"
+            "try:\n"
+            " with mock.patch.object(m.os,'replace',side_effect=corrupt): s._write(state)\n"
+            "except Refusal as error:\n"
+            " raise SystemExit(0 if error.code=='RECOVERY_REQUIRED' else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "prepared-restart-rolls-back-new-state",
+        "storage.py",
+        (
+            "        elif journal[\"phase\"] == \"prepared\":\n"
+            "            if new_matches:"
+        ),
+        (
+            "        elif journal[\"phase\"] == \"prepared\":\n"
+            "            if False:"
+        ),
+        (
+            "from pathlib import Path\n"
+            "import json\n"
+            "import rapp_virtual_as400.storage as m\n"
+            "s=m.AtomicStore(Path('state.json')); old=s.path.read_bytes()\n"
+            "state=m.empty_state(); state['revision']=1\n"
+            "new=json.dumps(state,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()\n"
+            "s._publish_file(s.recovery_path,s._journal_bytes('prepared',old,new,True))\n"
+            "s._publish_file(s.path,new)\n"
+            "reopened=m.AtomicStore(s.path)\n"
+            "raise SystemExit(0 if reopened.path.read_bytes()==old and "
+            "not reopened.recovery_path.exists() else 1)\n"
+        ),
+    ),
+    Mutation(
         "windows-directory-open-fallback",
         "storage.py",
         '    if os.name == "nt":\n        return',

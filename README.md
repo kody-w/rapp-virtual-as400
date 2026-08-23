@@ -49,7 +49,12 @@ credentials or production data. It is not production software.**
   counters, revisions, and queue/job referential integrity before atomic
   replacement. The same 4 MiB canonical serialized-state cap is checked before
   every atomic write and transaction commit; rejected growth leaves the prior
-  revision and bytes intact. Unexpected worker errors become stable refusals.
+  revision and bytes intact. A bounded private recovery journal makes
+  post-replace failures roll back exact prior bytes or fail closed with stable
+  `RECOVERY_REQUIRED`; restart resolves prepared publications before accepting
+  work. An operator can explicitly select the journal's exact prior bytes with
+  `AtomicStore(path, recover=True)`. Expected publication failures are stable
+  HTTP and worker refusals.
 - Evidence proves deterministic replication, disposable replay, and
   convergence, including a 100-replica release proof. Replay never resets or
   restores a live neighborhood node.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rapp-virtual-as400"
-version = "0.1.0"
+version = "0.2.0"
 description = "Clean-room local RAPP/1 virtual operations neighborhood"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,3 +32,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"rapp_virtual_as400.zoo" = ["*.json"]

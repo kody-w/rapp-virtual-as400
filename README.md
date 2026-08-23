@@ -21,6 +21,10 @@ credentials or production data. It is not production software.**
   traversal, or outbound network feature exists.
 - Batch transactions roll back on refusal; exact decimals remain strings.
 - Idempotency, durable sessions, concurrency serialization, and bounded data.
+- A provider-neutral private-vNet simulator runs isolated local node
+  processes over typed parent/child pipes, without LAN or sibling routes.
+- Hash-chained evidence proves deterministic replication, replay, and
+  convergence, including a 100-replica release proof.
 
 ## Quick start
 
@@ -78,6 +82,7 @@ CRTPF FILE(DEMO/ITEMS) FIELDS(ID:CHAR(8),QTY:INT,PRICE:DECIMAL(10,2))
 INSERT FILE(DEMO/ITEMS) VALUES(ID='A1',QTY='2',PRICE='10.20')
 UPDATE FILE(DEMO/ITEMS) SET(QTY='3') WHERE(ID='A1')
 SELECT FILE(DEMO/ITEMS) WHERE(ID='A1')
+DELETE FILE(DEMO/ITEMS) WHERE(ID='A1')
 DISPLAY FILE(DEMO/ITEMS)
 CRTDTAQ DTAQ(DEMO/EVENTS)
 ENQUEUE DTAQ(DEMO/EVENTS) DATA('ready')
@@ -93,11 +98,32 @@ DSPLIB LIB(DEMO)
 Semicolon-separated commands are one transaction. See
 [`docs/COMMANDS.md`](docs/COMMANDS.md) for types and limits.
 
+## Multi-node private-vNet proof
+
+Here “private vNet” means the provider-neutral, local trust topology defined in
+[`docs/PRIVATE_VNET_TOPOLOGY.md`](docs/PRIVATE_VNET_TOPOLOGY.md), not a real
+cloud network. At least two isolated node processes have separate private state
+roots. Their only interconnection is bounded, typed RAPP/1 control through the
+parent process; no node opens a LAN listener or has a privileged sibling route.
+
+```bash
+PYTHONPATH=src python3 -m rapp_virtual_as400 \
+  --home .rapp-virtual-as400 neighborhood-proof
+```
+
+The proof converges replicated state, executes 100 bounded deterministic job
+simulations with all results identical, replays one node from append-only
+hash-chained evidence, and verifies convergence. Stochastic runs require an
+exact quorum declared before execution and retain every outlier.
+
 ## RAPP Zoo v2
 
-`agents/rapp_virtual_as400_agent.py` is a single-file BasicAgent-compatible
-adapter. It drives the same engine and accepts `**kwargs`. `store.v2.json`
-provides Store v2 metadata. Build the deterministic global-object manifest:
+The wheel installs
+`rapp_virtual_as400.zoo.rapp_virtual_as400_agent:RAPPVirtualAS400Agent` and
+package-data copies of Store v2 and global-object metadata. The documented
+`agents/rapp_virtual_as400_agent.py` and `store.v2.json` source mirrors are
+required to be byte-identical to the packaged authorities. Build both
+deterministic manifest copies:
 
 ```bash
 PYTHONPATH=src python3 -m rapp_virtual_as400 manifest --root .
@@ -111,6 +137,7 @@ operations neighborhood.” See [`docs/RAPP_ZOO.md`](docs/RAPP_ZOO.md).
 ```bash
 PYTHONPATH=src python3 -m unittest discover -v
 PYTHONPATH=src python3 tools/mutation_gate.py
+PYTHONPATH=src python3 -m rapp_virtual_as400 --home .rapp-virtual-as400 neighborhood-proof
 ```
 
 ## License

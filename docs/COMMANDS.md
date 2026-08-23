@@ -10,6 +10,7 @@ double-quoted and are never evaluated.
 | `CRTPF FILE(lib/file) FIELDS(name:type,...)` | Create a physical file |
 | `INSERT FILE(...) VALUES(field=value,...)` | Append one complete record |
 | `UPDATE FILE(...) SET(...) WHERE(...)` | Update exact-match records |
+| `DELETE FILE(...) WHERE(...)` | Delete exact-match records |
 | `SELECT FILE(...) [WHERE(...)]` | Return JSON-safe records |
 | `DISPLAY FILE(...) [WHERE(...)]` | Return a fixed-width table |
 | `DSPLIB [LIB(name)]` | Display library inventory |
@@ -20,6 +21,9 @@ double-quoted and are never evaluated.
 Supported fields are `CHAR(1..256)`, signed 64-bit `INT`, and
 `DECIMAL(precision,scale)` with precision 1–38. Decimal and integer values are
 persisted canonically as strings, avoiding JSON floating-point loss.
+`WHERE` values use the same canonicalization as inserted and updated values:
+for example, integer `03` matches stored `3`. Unknown `WHERE` fields are
+refused for `SELECT`, `UPDATE`, `DELETE`, `DISPLAY`, and `PRINT`.
 
 Limits include 4,096 input bytes, 16 commands per transaction, 64 libraries,
 128 files, 128 data queues, 128 job queues, 32 fields per file, 1,000 records

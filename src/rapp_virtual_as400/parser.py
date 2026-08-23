@@ -17,6 +17,7 @@ VERBS = {
     "CRTJOBQ",
     "INSERT",
     "UPDATE",
+    "DELETE",
     "SELECT",
     "DISPLAY",
     "DSPLIB",

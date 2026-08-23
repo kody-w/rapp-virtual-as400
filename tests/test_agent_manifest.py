@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.resources
 import importlib.util
 import json
 import os
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class AgentAndManifestTests(EngineTestCase):
     def test_single_file_agent_is_basic_agent_compatible(self) -> None:
-        path = ROOT / "agents" / "rapp_virtual_as400_agent.py"
+        path = ROOT / "src" / "rapp_virtual_as400" / "zoo" / "rapp_virtual_as400_agent.py"
         spec = importlib.util.spec_from_file_location("virtual_agent", path)
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)
@@ -43,3 +44,16 @@ class AgentAndManifestTests(EngineTestCase):
         self.assertEqual(manifest["license_dimension"], "MIT")
         self.assertTrue(manifest["summon_chant"]["ready"])
         self.assertEqual(store["schema_version"], 2)
+        package = ROOT / "src" / "rapp_virtual_as400" / "zoo"
+        self.assertEqual(
+            (ROOT / "agents" / "rapp_virtual_as400_agent.py").read_bytes(),
+            (package / "rapp_virtual_as400_agent.py").read_bytes(),
+        )
+        self.assertEqual((ROOT / "store.v2.json").read_bytes(), (package / "store.v2.json").read_bytes())
+        self.assertEqual(
+            (ROOT / "global-objects.manifest.json").read_bytes(),
+            (package / "global-objects.manifest.json").read_bytes(),
+        )
+        resources = importlib.resources.files("rapp_virtual_as400.zoo")
+        self.assertTrue(resources.joinpath("store.v2.json").is_file())
+        self.assertTrue(resources.joinpath("global-objects.manifest.json").is_file())

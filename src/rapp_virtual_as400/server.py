@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .engine import VirtualAS400
 from .errors import Refusal
+from .unicode_safe import canonical_json_strings
 
 MAX_REQUEST_BYTES = 8192
 
@@ -92,10 +93,16 @@ class RAPPHandler(BaseHTTPRequestHandler):
             raise Refusal("Invalid Content-Length.", "INVALID_REQUEST") from None
         if length < 1 or length > MAX_REQUEST_BYTES:
             raise Refusal("Request body must contain 1 to 8192 bytes.", "LIMIT_EXCEEDED")
+        raw = self.rfile.read(length)
         try:
-            payload = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Refusal("Request contains malformed Unicode.", "INVALID_REQUEST") from None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
             raise Refusal("Request body must be valid JSON.", "INVALID_REQUEST") from None
+        payload = canonical_json_strings(payload)
         if not isinstance(payload, dict):
             raise Refusal("Request body must be a JSON object.", "INVALID_REQUEST")
         extra = set(payload) - {"user_input", "session_id", "idempotency_key"}

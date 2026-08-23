@@ -6,13 +6,15 @@ import hashlib
 import json
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, localcontext
 from pathlib import Path
 
 from .errors import Refusal
 from .parser import Command, parse_batch, parse_pairs, require_name, require_qualified, unquote
 from .storage import AtomicStore
+from .unicode_safe import canonical_unicode
 
 MAX_LIBRARIES = 64
 MAX_FILES = 128
@@ -25,6 +27,7 @@ MAX_JOBS = 1000
 MAX_SPOOL = 500
 MAX_SESSIONS = 1000
 MAX_TEXT = 2048
+_EVENT_AT: ContextVar[str | None] = ContextVar("rapp_virtual_as400_event_at", default=None)
 ALLOWED_CLAUSES = {
     "CRTLIB": {"LIB"},
     "CRTPF": {"FILE", "FIELDS"},
@@ -32,6 +35,7 @@ ALLOWED_CLAUSES = {
     "CRTJOBQ": {"JOBQ"},
     "INSERT": {"FILE", "VALUES"},
     "UPDATE": {"FILE", "SET", "WHERE"},
+    "DELETE": {"FILE", "WHERE"},
     "SELECT": {"FILE", "WHERE"},
     "DISPLAY": {"FILE", "WHERE"},
     "DSPLIB": {"LIB"},
@@ -49,6 +53,7 @@ REQUIRED_CLAUSES = {
     "CRTJOBQ": {"JOBQ"},
     "INSERT": {"FILE", "VALUES"},
     "UPDATE": {"FILE", "SET", "WHERE"},
+    "DELETE": {"FILE", "WHERE"},
     "SELECT": {"FILE"},
     "DISPLAY": {"FILE"},
     "DSPLIB": set(),
@@ -72,7 +77,20 @@ class VirtualAS400:
         user_input: str,
         session_id: str | None = None,
         idempotency_key: str | None = None,
+        *,
+        event_at: str | None = None,
     ) -> dict:
+        if not isinstance(user_input, str):
+            raise Refusal("user_input must be a non-empty string.", "INVALID_REQUEST")
+        user_input = canonical_unicode(user_input)
+        if session_id is not None and isinstance(session_id, str):
+            session_id = canonical_unicode(session_id)
+        if idempotency_key is not None and isinstance(idempotency_key, str):
+            idempotency_key = canonical_unicode(idempotency_key)
+        if event_at is not None:
+            if not isinstance(event_at, str) or not 1 <= len(event_at) <= 64:
+                raise Refusal("event_at has an invalid format.", "INVALID_REQUEST")
+            event_at = canonical_unicode(event_at)
         session_id = self._session_id(session_id)
         commands = parse_batch(user_input)
         request_hash = hashlib.sha256(user_input.encode("utf-8")).hexdigest()
@@ -92,7 +110,11 @@ class VirtualAS400:
             logs: list[dict] = []
             for command in commands:
                 self._validate_clauses(command)
-                output = self._execute(state, command)
+                event_token = _EVENT_AT.set(event_at)
+                try:
+                    output = self._execute(state, command)
+                finally:
+                    _EVENT_AT.reset(event_token)
                 outputs.append(output)
                 logs.append({"command": command.verb, "status": "ok"})
             result = {
@@ -103,7 +125,7 @@ class VirtualAS400:
             session = state["sessions"].setdefault(session_id, {"turns": []})
             session["turns"].append(
                 {
-                    "at": datetime.now(timezone.utc).isoformat(),
+                    "at": event_at or datetime.now(timezone.utc).isoformat(),
                     "input": user_input,
                     "response": result["response"],
                 }
@@ -246,19 +268,23 @@ class VirtualAS400:
             if not -(2**63) <= number < 2**63:
                 raise Refusal(f"{field['name']} exceeds signed 64-bit range.", "INVALID_RECORD")
             return str(number)
-        try:
-            number = Decimal(value)
-        except InvalidOperation:
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
             raise Refusal(f"{field['name']} requires a decimal.", "INVALID_RECORD") from None
-        if not number.is_finite():
-            raise Refusal(f"{field['name']} requires a finite decimal.", "INVALID_RECORD")
         scale = field["scale"]
-        quantum = Decimal(1).scaleb(-scale)
-        if number != number.quantize(quantum):
+        precision = field["precision"]
+        try:
+            with localcontext() as context:
+                context.prec = precision
+                number = Decimal(value)
+                quantum = Decimal(1).scaleb(-scale)
+                quantized = number.quantize(quantum)
+        except DecimalException:
+            raise Refusal(f"{field['name']} exceeds declared precision.", "INVALID_RECORD") from None
+        if number != quantized:
             raise Refusal(f"{field['name']} exceeds declared scale.", "INVALID_RECORD")
-        normalized = f"{number:.{scale}f}"
+        normalized = f"{quantized:.{scale}f}"
         digits = len(normalized.replace("-", "").replace(".", ""))
-        if digits > field["precision"]:
+        if digits > precision:
             raise Refusal(f"{field['name']} exceeds declared precision.", "INVALID_RECORD")
         return normalized
 
@@ -270,25 +296,40 @@ class VirtualAS400:
         file["records"].append(record)
         return f"1 record inserted into {library_name}/{file_name}."
 
-    def _matches(self, record: dict, where: str | None) -> bool:
+    def _where(self, file: dict, where: str | None) -> dict[str, str]:
+        if where is None:
+            return {}
+        return self._coerce_record(file, parse_pairs(where), partial=True)
+
+    @staticmethod
+    def _matches(record: dict, where: dict[str, str]) -> bool:
         if not where:
             return True
-        pairs = parse_pairs(where)
-        return all(record.get(key) == value for key, value in pairs.items())
+        return all(record[key] == value for key, value in where.items())
 
     def _do_update(self, state: dict, clauses: dict) -> str:
         library_name, file_name, file = self._file(state, clauses["FILE"])
         updates = self._coerce_record(file, parse_pairs(clauses["SET"]), partial=True)
+        where = self._where(file, clauses["WHERE"])
         count = 0
         for record in file["records"]:
-            if self._matches(record, clauses["WHERE"]):
+            if self._matches(record, where):
                 record.update(updates)
                 count += 1
         return f"{count} record(s) updated in {library_name}/{file_name}."
 
+    def _do_delete(self, state: dict, clauses: dict) -> str:
+        library_name, file_name, file = self._file(state, clauses["FILE"])
+        where = self._where(file, clauses["WHERE"])
+        retained = [record for record in file["records"] if not self._matches(record, where)]
+        count = len(file["records"]) - len(retained)
+        file["records"] = retained
+        return f"{count} record(s) deleted from {library_name}/{file_name}."
+
     def _select_records(self, state: dict, clauses: dict) -> tuple[str, list[dict], list[str]]:
         library_name, file_name, file = self._file(state, clauses["FILE"])
-        records = [record for record in file["records"] if self._matches(record, clauses.get("WHERE"))]
+        where = self._where(file, clauses.get("WHERE"))
+        records = [record for record in file["records"] if self._matches(record, where)]
         fields = [field["name"] for field in file["fields"]]
         return f"{library_name}/{file_name}", records, fields
 
@@ -408,7 +449,7 @@ class VirtualAS400:
             {
                 "id": spool_id,
                 "title": title,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": _EVENT_AT.get() or datetime.now(timezone.utc).isoformat(),
                 "report": report,
             }
         )

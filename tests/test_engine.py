@@ -34,6 +34,35 @@ class EngineTests(EngineTestCase):
         self.assertEqual(state["libraries"]["TEST"]["files"]["ITEMS"]["records"][0]["PRICE"], "0.10")
         json.dumps(state)
 
+    def test_where_values_are_schema_canonicalized_for_select_update_delete(self) -> None:
+        self.bootstrap()
+        self.engine.chat(
+            "INSERT FILE(TEST/ITEMS) VALUES(ID='A1',QTY='3',PRICE='10.20',NOTE='safe'); "
+            "INSERT FILE(TEST/ITEMS) VALUES(ID='A2',QTY='4',PRICE='20.00',NOTE='keep')",
+            "s",
+        )
+        selected = self.engine.chat("SELECT FILE(TEST/ITEMS) WHERE(QTY='03',PRICE='10.2')", "s")
+        self.assertIn('"ID":"A1"', selected["response"])
+        updated = self.engine.chat(
+            "UPDATE FILE(TEST/ITEMS) SET(NOTE='updated') WHERE(QTY='003')", "s"
+        )
+        self.assertIn("1 record(s) updated", updated["response"])
+        deleted = self.engine.chat("DELETE FILE(TEST/ITEMS) WHERE(PRICE='10.20')", "s")
+        self.assertIn("1 record(s) deleted", deleted["response"])
+        remaining = self.engine.chat("SELECT FILE(TEST/ITEMS)", "s")["response"]
+        self.assertNotIn('"ID":"A1"', remaining)
+        self.assertIn('"ID":"A2"', remaining)
+
+    def test_unknown_where_fields_are_refused_in_select_update_delete(self) -> None:
+        self.bootstrap()
+        for command in [
+            "SELECT FILE(TEST/ITEMS) WHERE(UNKNOWN='x')",
+            "UPDATE FILE(TEST/ITEMS) SET(QTY='1') WHERE(UNKNOWN='x')",
+            "DELETE FILE(TEST/ITEMS) WHERE(UNKNOWN='x')",
+        ]:
+            with self.subTest(command=command), self.assertRaisesRegex(Refusal, "Unknown field"):
+                self.engine.chat(command, "s")
+
     def test_batch_rolls_back_all_mutations(self) -> None:
         with self.assertRaises(Refusal):
             self.engine.chat("CRTLIB LIB(ROLLBACK); INSERT FILE(ROLLBACK/MISSING) VALUES(A='x')", "s")

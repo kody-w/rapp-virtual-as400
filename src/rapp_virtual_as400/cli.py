@@ -11,6 +11,7 @@ from pathlib import Path
 from .engine import VirtualAS400
 from .errors import Refusal
 from .manifest import build_manifest
+from .neighborhood import PrivateVNetNeighborhood
 from .server import serve
 
 
@@ -34,6 +35,7 @@ def parser() -> argparse.ArgumentParser:
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=7084)
     commands.add_parser("demo", help="Load synthetic sample operations")
+    commands.add_parser("neighborhood-proof", help="Prove two-node replay and 100-replica convergence")
     manifest = commands.add_parser("manifest", help="Build the global-object manifest")
     manifest.add_argument("--root", type=Path, default=Path.cwd())
     return result
@@ -56,6 +58,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "manifest":
             output = build_manifest(args.root)
             print(output)
+            return 0
+        if args.action == "neighborhood-proof":
+            with PrivateVNetNeighborhood(home / "private-vnet") as neighborhood:
+                replicated = neighborhood.replicate_chat(
+                    "CRTLIB LIB(PROOF); CRTJOBQ JOBQ(PROOF/BATCH)",
+                    "proof",
+                    "proof-bootstrap-v1",
+                )
+                run = neighborhood.run_replicated_job(
+                    {"name": "BOUNDED-JOB", "payload": {"command": "DISPLAY", "synthetic": True}},
+                    replicas=100,
+                    mode="deterministic",
+                )
+                replay = neighborhood.replay_and_verify("AS400-B")
+                proof = {
+                    "protocol": "RAPP/1",
+                    "proof": "private-vnet-neighborhood",
+                    "topology": neighborhood.topology(),
+                    "replicated_chat": replicated,
+                    "replicated_run": run,
+                    "replay": replay,
+                    "evidence_events": len(neighborhood.ledger.read()),
+                }
+                print(json.dumps(proof, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         engine = VirtualAS400(home / "state.json")
         if args.action == "demo":

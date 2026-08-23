@@ -64,6 +64,98 @@ class ServerE2ETests(EngineTestCase):
         self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
         self.assertEqual(body["agent_logs"], [])
 
+    def test_decimal_precision_28_29_and_38_through_live_chat(self) -> None:
+        values = {
+            28: "9" * 28,
+            29: "9" * 29,
+            38: "9" * 38,
+        }
+        commands = ["CRTLIB LIB(PRECISION)"]
+        for precision, value in values.items():
+            commands.extend(
+                [
+                    f"CRTPF FILE(PRECISION/P{precision}) FIELDS(V:DECIMAL({precision},0))",
+                    f"INSERT FILE(PRECISION/P{precision}) VALUES(V='{value}')",
+                    f"SELECT FILE(PRECISION/P{precision}) WHERE(V='{value}')",
+                ]
+            )
+        status, body = self.request("/chat", {"user_input": "; ".join(commands), "session_id": "decimal"})
+        self.assertEqual(status, 200)
+        for value in values.values():
+            self.assertIn(f'"V":"{value}"', body["response"])
+
+    def test_decimal_error_is_stable_live_refusal(self) -> None:
+        status, _ = self.request(
+            "/chat",
+            {
+                "user_input": (
+                    "CRTLIB LIB(PREC); CRTPF FILE(PREC/F) FIELDS(V:DECIMAL(38,0)); "
+                    f"INSERT FILE(PREC/F) VALUES(V='{'9' * 39}')"
+                ),
+                "session_id": "decimal-error",
+            },
+        )
+        self.assertEqual(status, 422)
+        status, body = self.request(
+            "/chat",
+            {
+                "user_input": (
+                    "CRTLIB LIB(PREC); CRTPF FILE(PREC/F) FIELDS(V:DECIMAL(38,0)); "
+                    f"INSERT FILE(PREC/F) VALUES(V='{'9' * 39}')"
+                ),
+                "session_id": "decimal-error",
+            },
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "INVALID_RECORD")
+        self.assertEqual(body["error"]["message"], "V exceeds declared precision.")
+        self.assertEqual(set(body), {"error", "agent_logs", "session_id"})
+
+    def test_unpaired_surrogate_is_exact_raw_http_422_refusal(self) -> None:
+        request = urllib.request.Request(
+            self.base + "/chat",
+            data=b'{"user_input":"DSPLIB \\ud800","session_id":"unicode"}',
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=2)
+        error = caught.exception
+        try:
+            body = json.loads(error.read())
+        finally:
+            error.close()
+        self.assertEqual(error.code, 422)
+        self.assertEqual(
+            body,
+            {
+                "error": {
+                    "type": "refusal",
+                    "code": "INVALID_REQUEST",
+                    "message": "Request contains malformed Unicode.",
+                },
+                "agent_logs": [],
+                "session_id": "",
+            },
+        )
+
+    def test_invalid_utf8_is_exact_raw_http_422_refusal(self) -> None:
+        request = urllib.request.Request(
+            self.base + "/chat",
+            data=b'{"user_input":"\xff"}',
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=2)
+        error = caught.exception
+        try:
+            body = json.loads(error.read())
+        finally:
+            error.close()
+        self.assertEqual(error.code, 422)
+        self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
+        self.assertEqual(body["error"]["message"], "Request contains malformed Unicode.")
+        self.assertEqual(set(body), {"error", "agent_logs", "session_id"})
+
     def test_stop_requires_capability_not_pid(self) -> None:
         status, _ = self.request("/admin/stop", {})
         self.assertEqual(status, 403)

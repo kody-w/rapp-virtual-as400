@@ -88,3 +88,16 @@ class AtomicStore:
     def snapshot(self) -> dict:
         with self._thread_lock:
             return copy.deepcopy(self._read())
+
+    def reset(self) -> None:
+        with self._thread_lock:
+            lock_descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.chmod(self.lock_path, 0o600)
+                if fcntl:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                self._write(empty_state())
+            finally:
+                if fcntl:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                os.close(lock_descriptor)

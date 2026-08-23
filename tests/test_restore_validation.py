@@ -78,6 +78,14 @@ class RestoreValidationTests(EngineTestCase):
         bad_spool_counter["next_spool"] = 1
         cases["reused spool counter"] = bad_spool_counter
 
+        exhausted_job_counter = copy.deepcopy(base)
+        exhausted_job_counter["next_job"] = 1000001
+        cases["job counter beyond exhausted state"] = exhausted_job_counter
+
+        exhausted_spool_counter = copy.deepcopy(base)
+        exhausted_spool_counter["next_spool"] = 1000001
+        cases["spool counter beyond exhausted state"] = exhausted_spool_counter
+
         bad_cache = copy.deepcopy(base)
         cached = next(iter(bad_cache["idempotency"].values()))
         cached["request_hash"] = "not-a-digest"

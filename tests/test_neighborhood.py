@@ -405,6 +405,168 @@ class NeighborhoodTests(EngineTestCase):
         with self.assertRaisesRegex(Refusal, "reference"):
             ledger.read_snapshot_bundle({**reference, "path": "../state.json"})
 
+    def test_snapshot_bundle_publication_failures_precede_intent_and_mutation(self) -> None:
+        stages = ("write", "rename", "directory-fsync")
+        for stage in stages:
+            with self.subTest(stage=stage):
+                with PrivateVNetNeighborhood(self.work / stage) as neighborhood:
+                    before = neighborhood._snapshots()
+                    original_write = os.write
+                    partial_write_done = False
+
+                    def fail_partial_write(descriptor: int, data: bytes) -> int:
+                        nonlocal partial_write_done
+                        if not partial_write_done:
+                            partial_write_done = True
+                            return original_write(descriptor, data[:3])
+                        raise OSError("injected bundle write failure")
+
+                    if stage == "write":
+                        patcher = mock.patch.object(
+                            neighborhood_module.os,
+                            "write",
+                            side_effect=fail_partial_write,
+                        )
+                    elif stage == "rename":
+                        patcher = mock.patch.object(
+                            neighborhood_module.os,
+                            "link",
+                            side_effect=OSError("injected bundle publication failure"),
+                        )
+                    else:
+                        patcher = mock.patch.object(
+                            neighborhood_module,
+                            "_fsync_directory",
+                            side_effect=OSError("injected snapshot directory fsync failure"),
+                        )
+                    with patcher, self.assertRaises(Refusal):
+                        neighborhood.replicate_chat(
+                            "CRTLIB LIB(NEVER)",
+                            stage,
+                            stage,
+                        )
+                    self.assertEqual(neighborhood._snapshots(), before)
+                    self.assertEqual(neighborhood.ledger.read(), [])
+                    children = list((neighborhood.ledger.path.parent / "snapshots").iterdir())
+                    self.assertFalse(
+                        any(neighborhood_module.BUNDLE_TEMP_RE.fullmatch(child.name) for child in children)
+                    )
+                    self.assertFalse(
+                        any(
+                            entry["record"].get("type") == "replicated_chat_commit"
+                            for entry in neighborhood.ledger.read()
+                        )
+                    )
+
+    def test_snapshot_bundle_is_immutable_and_crash_artifacts_recover_safely(self) -> None:
+        path = self.work / "durable" / "events.jsonl"
+        ledger = neighborhood_module.EvidenceLedger(path)
+        first = {"pre_snapshots": {}, "pre_state_hashes": {}}
+        reference = ledger.write_snapshot_bundle("intent-1.json", first)
+        destination = ledger.path.parent / reference["path"]
+        original = destination.read_bytes()
+        with self.assertRaisesRegex(Refusal, "immutable"):
+            ledger.write_snapshot_bundle(
+                "intent-1.json",
+                {"pre_snapshots": {"AS400-A": empty_state()}, "pre_state_hashes": {}},
+            )
+        self.assertEqual(destination.read_bytes(), original)
+
+        stale = destination.parent / ".intent-2.json.0123456789abcdef0123456789abcdef.tmp"
+        stale.write_bytes(b'{"partial":')
+        os.chmod(stale, 0o600)
+        reopened = neighborhood_module.EvidenceLedger(path)
+        self.assertFalse(stale.exists())
+        self.assertEqual(reopened.write_snapshot_bundle("intent-1.json", first), reference)
+        self.assertEqual(reopened.read(), [])
+        self.assertEqual(reopened.read_snapshot_bundle(reference), first)
+
+    def test_directory_durability_precedes_intent_append(self) -> None:
+        with PrivateVNetNeighborhood(self.work / "ordering") as neighborhood:
+            durable = False
+            original_fsync = neighborhood_module._fsync_directory
+            original_append = neighborhood.ledger.append
+            snapshots = neighborhood.ledger.path.parent / "snapshots"
+
+            def observed_fsync(path) -> None:
+                nonlocal durable
+                original_fsync(path)
+                if path == snapshots:
+                    durable = True
+
+            def guarded_append(record: dict) -> dict:
+                if record.get("type") in {
+                    "replicated_chat_intent",
+                    "replicated_chat_commit",
+                    "replicated_chat_failure",
+                }:
+                    self.assertTrue(durable)
+                return original_append(record)
+
+            neighborhood.ledger.append = guarded_append  # type: ignore[method-assign]
+            with mock.patch.object(
+                neighborhood_module,
+                "_fsync_directory",
+                side_effect=observed_fsync,
+            ):
+                neighborhood.replicate_chat("CRTLIB LIB(DURABLE)", "durable", "durable")
+            neighborhood.ledger.audit()
+
+    def test_exhausted_identifier_state_is_valid_snapshot_evidence(self) -> None:
+        state = empty_state()
+        state["revision"] = 1
+        state["libraries"]["TEST"] = {
+            "files": {
+                "ITEMS": {
+                    "fields": [
+                        {"name": "ID", "type": "CHAR", "precision": 1, "scale": 0}
+                    ],
+                    "records": [],
+                }
+            }
+        }
+        state["job_queues"]["TEST/BATCH"] = []
+        state["jobs"]["J999999"] = {
+            "queue": "TEST/BATCH",
+            "command": "DSPLIB",
+            "status": "COMPLETE",
+            "result": "complete",
+        }
+        state["next_job"] = 1000000
+        state["spool"] = [
+            {
+                "id": "S999999",
+                "title": "Terminal",
+                "created_at": "2000-01-01T00:00:00+00:00",
+                "report": "terminal",
+            }
+        ]
+        state["next_spool"] = 1000000
+        with PrivateVNetNeighborhood(self.work / "exhausted-evidence") as neighborhood:
+            for node_id, node in neighborhood.nodes.items():
+                neighborhood._checked_response(
+                    node_id,
+                    node.request(
+                        {
+                            "protocol": "RAPP/1",
+                            "kind": "control",
+                            "operation": "restore",
+                            "state": state,
+                        }
+                    ),
+                    "restore",
+                )
+            neighborhood.replicate_chat("DSPLIB", "terminal", "terminal")
+            entries = neighborhood.ledger.audit()
+            bundle = neighborhood.ledger.read_snapshot_bundle(
+                entries[-1]["record"]["snapshot_bundle"]
+            )
+            for snapshot in bundle["pre_snapshots"].values():
+                self.assertEqual(
+                    (snapshot["next_job"], snapshot["next_spool"]),
+                    (1000000, 1000000),
+                )
+
     def test_byte_capacity_preflight_happens_before_chat_mutation(self) -> None:
         with PrivateVNetNeighborhood(self.work / "capacity") as neighborhood:
             chat_contacts = 0

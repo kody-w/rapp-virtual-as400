@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .errors import Refusal
 from .parser import Command, parse_batch, parse_pairs, require_name, require_qualified, unquote
-from .storage import AtomicStore
+from .storage import AtomicStore, MAX_SIX_DIGIT_ID
 from .unicode_safe import canonical_unicode
 
 MAX_LIBRARIES = 64
@@ -400,6 +400,8 @@ class VirtualAS400:
         key = "/".join(require_qualified(clauses["JOBQ"]))
         if key not in state["job_queues"]:
             raise Refusal(f"Job queue {key} does not exist.", "OBJECT_NOT_FOUND")
+        if state["next_job"] > MAX_SIX_DIGIT_ID:
+            raise Refusal("Job identifier space exhausted.", "LIMIT_EXCEEDED")
         if len(state["jobs"]) >= MAX_JOBS:
             raise Refusal("Job limit reached.", "LIMIT_EXCEEDED")
         embedded = unquote(clauses["CMD"])
@@ -439,6 +441,8 @@ class VirtualAS400:
 
     def _do_print(self, state: dict, clauses: dict) -> str:
         qualified, records, fields = self._select_records(state, clauses)
+        if state["next_spool"] > MAX_SIX_DIGIT_ID:
+            raise Refusal("Spool identifier space exhausted.", "LIMIT_EXCEEDED")
         title = unquote(clauses.get("TITLE", f"REPORT {qualified}"))
         if not 1 <= len(title) <= 120:
             raise Refusal("Report title must contain 1 to 120 characters.", "LIMIT_EXCEEDED")

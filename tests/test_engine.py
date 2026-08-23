@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 
-from rapp_virtual_as400 import Refusal
+from rapp_virtual_as400 import Refusal, VirtualAS400
+from rapp_virtual_as400.storage import AtomicStore
 
 from .support import EngineTestCase
 
@@ -97,6 +98,59 @@ class EngineTests(EngineTestCase):
         self.assertIn("Job J000001 COMPLETE", output)
         self.assertIn("Spool report S000001", output)
         self.assertIn("Synthetic Inventory", output)
+
+    def test_six_digit_job_and_spool_identifier_exhaustion_is_stable(self) -> None:
+        self.engine.chat(
+            "CRTLIB LIB(TEST); CRTPF FILE(TEST/ITEMS) FIELDS(ID:CHAR(1)); "
+            "CRTJOBQ JOBQ(TEST/BATCH)",
+            "setup",
+        )
+        boundary = self.engine.store.snapshot()
+        boundary["jobs"]["J999997"] = {
+            "queue": "TEST/BATCH",
+            "command": "DSPLIB",
+            "status": "COMPLETE",
+            "result": "complete",
+        }
+        boundary["next_job"] = 999998
+        boundary["spool"] = [
+            {
+                "id": "S999997",
+                "title": "Boundary",
+                "created_at": "2000-01-01T00:00:00+00:00",
+                "report": "boundary",
+            }
+        ]
+        boundary["next_spool"] = 999998
+        self.engine.store.restore(boundary)
+
+        at_999998 = self.engine.chat(
+            'SUBMIT JOBQ(TEST/BATCH) CMD("DSPLIB"); PRINT FILE(TEST/ITEMS)',
+            "boundary",
+        )
+        self.assertIn("J999998", at_999998["response"])
+        self.assertIn("S999998", at_999998["response"])
+        at_999999 = self.engine.chat(
+            'SUBMIT JOBQ(TEST/BATCH) CMD("DSPLIB"); PRINT FILE(TEST/ITEMS)',
+            "boundary",
+        )
+        self.assertIn("J999999", at_999999["response"])
+        self.assertIn("S999999", at_999999["response"])
+
+        terminal = self.engine.store.snapshot()
+        self.assertEqual((terminal["next_job"], terminal["next_spool"]), (1000000, 1000000))
+        self.assertEqual(AtomicStore.validate_snapshot(terminal), terminal)
+        restored = VirtualAS400(self.work / "terminal" / "state.json")
+        restored.store.restore(terminal)
+        for command, message in (
+            ('SUBMIT JOBQ(TEST/BATCH) CMD("DSPLIB")', "Job identifier space exhausted"),
+            ("PRINT FILE(TEST/ITEMS)", "Spool identifier space exhausted"),
+        ):
+            before = restored.store.snapshot()
+            with self.subTest(command=command), self.assertRaisesRegex(Refusal, message) as caught:
+                restored.chat(command, "exhausted")
+            self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+            self.assertEqual(restored.store.snapshot(), before)
 
     def test_display_empty_file(self) -> None:
         self.bootstrap()

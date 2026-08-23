@@ -28,7 +28,10 @@ refused for `SELECT`, `UPDATE`, `DELETE`, `DISPLAY`, and `PRINT`.
 Limits include 4,096 input bytes, 16 commands per transaction, 64 libraries,
 128 files, 128 data queues, 128 job queues, 32 fields per file, 1,000 records
 per file, 1,000 queue entries, 1,000 jobs, 1,000 sessions, 500 retained spool
-entries, and 2,048 characters per value.
+entries, and 2,048 characters per value. Job and spool identifiers are fixed
+six-digit values (`J000001`..`J999999` and `S000001`..`S999999`). Their final
+values are valid durable state; later `SUBMIT` or `PRINT` requests are refused
+with `LIMIT_EXCEEDED` without changing that state.
 
 The parser only dispatches named handlers. There is no general interpreter,
 shell subprocess, SQL parser, Python evaluation, path argument, socket client,

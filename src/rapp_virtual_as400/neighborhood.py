@@ -6,9 +6,11 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,8 +26,11 @@ MAX_JOB_BYTES = 2048
 MAX_EVIDENCE_EVENTS = 10_000
 MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_EVIDENCE_RECORD_BYTES = 512 * 1024
+MAX_SNAPSHOT_BUNDLE_BYTES = MAX_EVIDENCE_BYTES - MAX_EVIDENCE_RECORD_BYTES
 MAX_RESTORE_MESSAGE_BYTES = MAX_RESTORE_SNAPSHOT_BYTES + 1024
 NODE_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,31}$")
+BUNDLE_NAME_RE = re.compile(r"intent-[1-9][0-9]*\.json")
+BUNDLE_TEMP_RE = re.compile(r"\.intent-[1-9][0-9]*\.json\.[0-9a-f]{32}\.tmp")
 
 
 def _json_bytes(value: object) -> bytes:
@@ -40,6 +45,14 @@ def _json_bytes(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_json_bytes(value)).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class EvidenceLedger:
@@ -57,6 +70,15 @@ class EvidenceLedger:
                 descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 os.close(descriptor)
             os.chmod(self.path, 0o600)
+            self._snapshots_path = self.path.parent / "snapshots"
+            snapshots_created = not self._snapshots_path.exists()
+            self._snapshots_path.mkdir(parents=False, exist_ok=True, mode=0o700)
+            if self._snapshots_path.is_symlink() or not self._snapshots_path.is_dir():
+                raise Refusal("Snapshot evidence directory is unsafe.", "EVIDENCE_INVALID")
+            os.chmod(self._snapshots_path, 0o700)
+            if snapshots_created:
+                _fsync_directory(self.path.parent)
+            self._cleanup_stale_bundle_temps()
             self._write_bundle_bytes(self._scan_bundle_bytes())
             self._sequence, self._previous = self._refresh_tail()
 
@@ -139,13 +161,28 @@ class EvidenceLedger:
 
     def _scan_bundle_bytes(self) -> int:
         total = 0
-        directory = self.path.parent / "snapshots"
-        if directory.exists():
-            for child in directory.iterdir():
-                if child.is_symlink() or not child.is_file():
-                    raise Refusal("Snapshot evidence contains an unsafe entry.", "EVIDENCE_INVALID")
-                total += child.stat().st_size
+        for child in self._snapshots_path.iterdir():
+            if (
+                BUNDLE_NAME_RE.fullmatch(child.name) is None
+                or child.is_symlink()
+                or not child.is_file()
+            ):
+                raise Refusal("Snapshot evidence contains an unsafe entry.", "EVIDENCE_INVALID")
+            total += child.stat().st_size
         return total
+
+    def _cleanup_stale_bundle_temps(self) -> None:
+        removed = False
+        for child in self._snapshots_path.iterdir():
+            if BUNDLE_TEMP_RE.fullmatch(child.name) is None:
+                continue
+            metadata = child.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise Refusal("Snapshot evidence contains an unsafe temporary.", "EVIDENCE_INVALID")
+            child.unlink()
+            removed = True
+        if removed:
+            _fsync_directory(self._snapshots_path)
 
     def _write_bundle_bytes(self, value: int) -> None:
         temporary = self._bundle_bytes_path.with_suffix(".new")
@@ -260,10 +297,43 @@ class EvidenceLedger:
                 raise Refusal("Evidence byte limit reached.", "LIMIT_EXCEEDED")
             yield
 
-    def preflight_transaction(self, bundle_bytes: int) -> None:
+    def preflight_transaction(
+        self,
+        bundle_bytes: int,
+        filename: str | None = None,
+        digest: str | None = None,
+    ) -> None:
+        if (
+            not isinstance(bundle_bytes, int)
+            or isinstance(bundle_bytes, bool)
+            or not 1 <= bundle_bytes <= MAX_SNAPSHOT_BUNDLE_BYTES
+        ):
+            raise Refusal("Snapshot bundle exceeds its byte limit.", "LIMIT_EXCEEDED")
         with self.transaction_lock:
             self._refresh_tail()
-            required = bundle_bytes + MAX_EVIDENCE_RECORD_BYTES
+            additional = bundle_bytes
+            if filename is not None or digest is not None:
+                if (
+                    not isinstance(filename, str)
+                    or BUNDLE_NAME_RE.fullmatch(filename) is None
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise Refusal("Snapshot bundle preflight is invalid.", "INVALID_REQUEST")
+                destination = self._snapshots_path / filename
+                if destination.exists():
+                    metadata = destination.lstat()
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_size != bundle_bytes
+                        or hashlib.sha256(destination.read_bytes()).hexdigest() != digest
+                    ):
+                        raise Refusal(
+                            "Existing snapshot bundle is immutable.",
+                            "EVIDENCE_INVALID",
+                        )
+                    additional = 0
+            required = additional + (2 * MAX_EVIDENCE_RECORD_BYTES)
             if self._evidence_bytes() + required > MAX_EVIDENCE_BYTES:
                 raise Refusal("Evidence byte limit reached.", "LIMIT_EXCEEDED")
 
@@ -304,36 +374,72 @@ class EvidenceLedger:
             return entry
 
     def write_snapshot_bundle(self, filename: str, bundle: dict) -> dict:
-        if not re.fullmatch(r"intent-[1-9][0-9]*\.json", filename):
+        if BUNDLE_NAME_RE.fullmatch(filename) is None:
             raise Refusal("Snapshot evidence filename is invalid.", "INVALID_REQUEST")
         encoded = _json_bytes(bundle)
+        if not 1 <= len(encoded) <= MAX_SNAPSHOT_BUNDLE_BYTES:
+            raise Refusal("Snapshot bundle exceeds its byte limit.", "LIMIT_EXCEEDED")
+        reference = {
+            "path": f"snapshots/{filename}",
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "bytes": len(encoded),
+        }
         with self.transaction_lock:
             current_bundle_bytes = self._read_bundle_bytes()
+            destination = self._snapshots_path / filename
+            if destination.exists():
+                metadata = destination.lstat()
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size != len(encoded)
+                    or destination.read_bytes() != encoded
+                ):
+                    raise Refusal("Existing snapshot bundle is immutable.", "EVIDENCE_INVALID")
+                _fsync_directory(self._snapshots_path)
+                return reference
             if self.path.stat().st_size + current_bundle_bytes + len(encoded) > MAX_EVIDENCE_BYTES:
                 raise Refusal("Evidence byte limit reached.", "LIMIT_EXCEEDED")
-            directory = self.path.parent / "snapshots"
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(directory, 0o700)
-            destination = directory / filename
-            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+            temporary = self._snapshots_path / f".{filename}.{uuid.uuid4().hex}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = -1
+            published = False
             try:
-                with os.fdopen(descriptor, "wb", closefd=True) as handle:
-                    handle.write(encoded)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.chmod(destination, 0o600)
+                descriptor = os.open(temporary, flags, 0o600)
+                offset = 0
+                while offset < len(encoded):
+                    written = os.write(descriptor, encoded[offset:])
+                    if written <= 0:
+                        raise OSError("Snapshot bundle write was incomplete.")
+                    offset += written
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = -1
+                os.link(temporary, destination, follow_symlinks=False)
+                published = True
+                temporary.unlink()
+                _fsync_directory(self._snapshots_path)
                 self._write_bundle_bytes(current_bundle_bytes + len(encoded))
             except Exception:
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
                 try:
-                    destination.unlink()
+                    temporary.unlink()
                 except OSError:
                     pass
+                if published:
+                    try:
+                        destination.unlink()
+                        _fsync_directory(self._snapshots_path)
+                    except OSError:
+                        pass
                 raise
-            return {
-                "path": str(destination.relative_to(self.path.parent)),
-                "sha256": hashlib.sha256(encoded).hexdigest(),
-                "bytes": len(encoded),
-            }
+            return reference
 
     def read_snapshot_bundle(self, reference: object) -> dict:
         if not isinstance(reference, dict) or set(reference) != {"path", "sha256", "bytes"}:
@@ -618,22 +724,6 @@ class PrivateVNetNeighborhood:
                 "event_at": event_at,
             }
             snapshot_file = f"intent-{sequence}.json"
-            intent_record = {
-                "type": "replicated_chat_intent",
-                "message": message,
-                "nodes": list(self.nodes),
-                "snapshot_bundle_path": f"snapshots/{snapshot_file}",
-            }
-            intent = self.ledger.append(intent_record)
-            intent_link = {
-                "intent_sequence": intent["sequence"],
-                "intent_event_hash": intent["event_hash"],
-            }
-            pre_snapshots: dict[str, dict] = {}
-            pre_state_hashes: dict[str, str] = {}
-            bundle_reference: dict | None = None
-            bundle_written = False
-            mutation_started = False
             try:
                 pre_snapshots = self._snapshots()
                 pre_state_hashes = {
@@ -649,11 +739,42 @@ class PrivateVNetNeighborhood:
                     "sha256": hashlib.sha256(bundle_bytes).hexdigest(),
                     "bytes": len(bundle_bytes),
                 }
-                self.ledger.preflight_transaction(len(bundle_bytes))
+                self.ledger.preflight_transaction(
+                    len(bundle_bytes),
+                    snapshot_file,
+                    bundle_reference["sha256"],
+                )
                 written_reference = self.ledger.write_snapshot_bundle(snapshot_file, bundle)
                 if written_reference != bundle_reference:
                     raise Refusal("Snapshot bundle evidence diverged.", "EVIDENCE_IO_FAILED")
-                bundle_written = True
+            except Refusal:
+                raise
+            except Exception as error:
+                raise Refusal(
+                    f"Snapshot bundle publication failed ({type(error).__name__}).",
+                    "EVIDENCE_IO_FAILED",
+                ) from error
+
+            try:
+                intent = self.ledger.append(
+                    {
+                        "type": "replicated_chat_intent",
+                        "message": message,
+                        "nodes": list(self.nodes),
+                        "snapshot_bundle_path": bundle_reference["path"],
+                    }
+                )
+            except Exception as error:
+                raise Refusal(
+                    f"Intent evidence append failed ({type(error).__name__}).",
+                    "EVIDENCE_IO_FAILED",
+                ) from error
+            intent_link = {
+                "intent_sequence": intent["sequence"],
+                "intent_event_hash": intent["event_hash"],
+            }
+            mutation_started = False
+            try:
                 results: dict[str, dict] = {}
                 mutation_started = True
                 for node_id, node in self.nodes.items():
@@ -694,48 +815,34 @@ class PrivateVNetNeighborhood:
                 rollback_failures: list[str] = []
                 if mutation_started and len(pre_snapshots) == len(self.nodes):
                     restored_hashes, rollback_failures = self._restore_and_verify(pre_snapshots)
-                if bundle_written and bundle_reference is not None:
-                    try:
-                        self.ledger.append(
-                            {
-                                "type": "replicated_chat_failure",
-                                **intent_link,
-                                "message": message,
-                                "failure": self._failure_details(error),
-                                "snapshot_bundle": bundle_reference,
-                                "pre_state_hashes": pre_state_hashes,
-                                "rollback_required": mutation_started,
-                                "restored_state_hashes": restored_hashes,
-                                "rollback_verified": not mutation_started or not rollback_failures,
-                                "rollback_failures": rollback_failures,
-                                "restore": {
-                                    "status": (
-                                        "not_required"
-                                        if not mutation_started
-                                        else "verified"
-                                        if not rollback_failures
-                                        else "failed"
-                                    ),
-                                    "state_hashes": restored_hashes,
-                                    "failures": rollback_failures,
-                                },
-                            }
-                        )
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self.ledger.append(
-                            {
-                                "type": "replicated_chat_preflight_failure",
-                                **intent_link,
-                                "message": message,
-                                "failure": self._failure_details(error),
-                                "rollback_required": False,
-                            }
-                        )
-                    except Exception:
-                        pass
+                try:
+                    self.ledger.append(
+                        {
+                            "type": "replicated_chat_failure",
+                            **intent_link,
+                            "message": message,
+                            "failure": self._failure_details(error),
+                            "snapshot_bundle": bundle_reference,
+                            "pre_state_hashes": pre_state_hashes,
+                            "rollback_required": mutation_started,
+                            "restored_state_hashes": restored_hashes,
+                            "rollback_verified": not mutation_started or not rollback_failures,
+                            "rollback_failures": rollback_failures,
+                            "restore": {
+                                "status": (
+                                    "not_required"
+                                    if not mutation_started
+                                    else "verified"
+                                    if not rollback_failures
+                                    else "failed"
+                                ),
+                                "state_hashes": restored_hashes,
+                                "failures": rollback_failures,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
                 if rollback_failures:
                     raise Refusal(
                         "Replicated chat rollback could not be verified for every node.",

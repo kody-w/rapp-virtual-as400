@@ -195,8 +195,9 @@ MUTATIONS = [
             "  original=node.request\n"
             "  def guarded(message, original=original):\n"
             "   if message.get('operation')=='stop': return original(message)\n"
-            "   entries=n.ledger.read()\n"
-            "   if not entries or entries[-1]['record']['type']!='replicated_chat_intent': raise SystemExit(2)\n"
+            "   if message.get('kind')=='chat':\n"
+            "    entries=n.ledger.read()\n"
+            "    if not entries or entries[-1]['record']['type']!='replicated_chat_intent': raise SystemExit(2)\n"
             "   return original(message)\n"
             "  node.request=guarded\n"
             " n.replicate_chat('CRTLIB LIB(INTENT)','intent','intent')\n"
@@ -326,6 +327,63 @@ MUTATIONS = [
             "a.append({'type':'one'}); b.append({'type':'two'})\n"
             "entries=a.read()\n"
             "raise SystemExit(0 if [e['sequence'] for e in entries]==[1,2] else 1)\n"
+        ),
+    ),
+    Mutation(
+        "job-identifier-exhaustion",
+        "engine.py",
+        '        if state["next_job"] > MAX_SIX_DIGIT_ID:',
+        "        if False:",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import VirtualAS400,Refusal\n"
+            "from rapp_virtual_as400.storage import empty_state\n"
+            "s=empty_state(); s['revision']=1; s['libraries']['T']={'files':{}}; "
+            "s['job_queues']['T/Q']=[]; s['jobs']['J999999']="
+            "{'queue':'T/Q','command':'DSPLIB','status':'COMPLETE','result':'done'}; "
+            "s['next_job']=1000000\n"
+            "e=VirtualAS400(Path('state.json')); e.store.restore(s); before=e.store.snapshot()\n"
+            "try: e.chat('SUBMIT JOBQ(T/Q) CMD(\"DSPLIB\")','s')\n"
+            "except Refusal as error: raise SystemExit(0 if error.code=='LIMIT_EXCEEDED' and e.store.snapshot()==before else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "spool-identifier-exhaustion",
+        "engine.py",
+        '        if state["next_spool"] > MAX_SIX_DIGIT_ID:',
+        "        if False:",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import VirtualAS400,Refusal\n"
+            "from rapp_virtual_as400.storage import empty_state\n"
+            "s=empty_state(); s['revision']=1; s['libraries']['T']={'files':{'F':"
+            "{'fields':[{'name':'A','type':'CHAR','precision':1,'scale':0}],'records':[]}}}; "
+            "s['spool']=[{'id':'S999999','title':'x','created_at':'x','report':'x'}]; "
+            "s['next_spool']=1000000\n"
+            "e=VirtualAS400(Path('state.json')); e.store.restore(s); before=e.store.snapshot()\n"
+            "try: e.chat('PRINT FILE(T/F)','s')\n"
+            "except Refusal as error: raise SystemExit(0 if error.code=='LIMIT_EXCEEDED' and e.store.snapshot()==before else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "snapshot-directory-durability",
+        "neighborhood.py",
+        (
+            "                _fsync_directory(self._snapshots_path)\n"
+            "                self._write_bundle_bytes(current_bundle_bytes + len(encoded))"
+        ),
+        "                self._write_bundle_bytes(current_bundle_bytes + len(encoded))",
+        (
+            "from pathlib import Path\n"
+            "import shutil\n"
+            "import rapp_virtual_as400.neighborhood as m\n"
+            "shutil.rmtree('evidence',ignore_errors=True)\n"
+            "ledger=m.EvidenceLedger(Path('evidence/events.jsonl')); called=[]\n"
+            "m._fsync_directory=lambda path: called.append(path)\n"
+            "ledger.write_snapshot_bundle('intent-1.json',{'pre_snapshots':{},'pre_state_hashes':{}})\n"
+            "raise SystemExit(0 if ledger._snapshots_path in called else 1)\n"
         ),
     ),
 ]

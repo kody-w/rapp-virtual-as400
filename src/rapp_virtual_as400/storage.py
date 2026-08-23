@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - POSIX
 
 MAX_RESTORE_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_SNAPSHOT_DEPTH = 32
+MAX_SIX_DIGIT_ID = 999_999
 _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[Path, "PortableRootLock"] = {}
 
@@ -191,6 +192,8 @@ class AtomicStore:
             minimum = 0 if field == "revision" else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise Refusal("Restore snapshot has an invalid counter.", "INVALID_SNAPSHOT")
+            if field != "revision" and value > MAX_SIX_DIGIT_ID + 1:
+                raise Refusal("Restore snapshot has an exhausted counter.", "INVALID_SNAPSHOT")
         for field in ("libraries", "data_queues", "job_queues", "jobs", "sessions", "idempotency"):
             if not isinstance(snapshot[field], dict):
                 raise Refusal("Restore snapshot has an invalid mapping.", "INVALID_SNAPSHOT")

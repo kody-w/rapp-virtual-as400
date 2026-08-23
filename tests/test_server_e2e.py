@@ -134,6 +134,110 @@ class ServerE2ETests(EngineTestCase):
         self.assertEqual(body["error"]["message"], "V exceeds declared precision.")
         self.assertEqual(set(body), {"error", "agent_logs", "session_id"})
 
+    def test_char_grammar_is_atomic_over_live_chat_and_restart(self) -> None:
+        state_path = self.work / "http-state.json"
+        for suffix in ("0", "2"):
+            before = self.server.engine.store.snapshot()
+            before_bytes = state_path.read_bytes()
+            status, body = self.request(
+                "/chat",
+                {
+                    "user_input": (
+                        f"CRTLIB LIB(BAD{suffix}); "
+                        f"CRTPF FILE(BAD{suffix}/F) FIELDS(V:CHAR(10,{suffix}))"
+                    ),
+                    "session_id": "char",
+                },
+            )
+            self.assertEqual(status, 422)
+            self.assertEqual(body["error"]["code"], "INVALID_SCHEMA")
+            self.assertEqual(self.server.engine.store.snapshot(), before)
+            self.assertEqual(state_path.read_bytes(), before_bytes)
+
+        status, body = self.request(
+            "/chat",
+            {
+                "user_input": "CRTLIB LIB(GOOD); CRTPF FILE(GOOD/F) FIELDS(V:CHAR(10))",
+                "session_id": "char",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Physical file GOOD/F created", body["response"])
+        expected = self.server.engine.store.snapshot()
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = RAPPServer(
+            ("127.0.0.1", 0),
+            state_path,
+            self.work / "stop.capability",
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.assertEqual(self.server.engine.store.snapshot(), expected)
+        self.assertEqual(self.request("/chat", {"user_input": "DISPLAY FILE(GOOD/F)"})[0], 200)
+
+    def test_submit_validation_is_atomic_over_live_chat_work_and_restart(self) -> None:
+        state_path = self.work / "http-state.json"
+        status, _ = self.request(
+            "/chat",
+            {
+                "user_input": "CRTLIB LIB(JOBS); CRTJOBQ JOBQ(JOBS/BATCH)",
+                "session_id": "jobs",
+            },
+        )
+        self.assertEqual(status, 200)
+
+        for embedded in ("CRTLIB", "CRTLIB LIB(NEVER) EXTRA(x)"):
+            before = self.server.engine.store.snapshot()
+            before_bytes = state_path.read_bytes()
+            status, body = self.request(
+                "/chat",
+                {
+                    "user_input": f'SUBMIT JOBQ(JOBS/BATCH) CMD("{embedded}")',
+                    "session_id": "jobs",
+                },
+            )
+            self.assertEqual(status, 422)
+            self.assertIn(body["error"]["code"], {"MALFORMED_COMMAND", "COMMAND_NOT_ALLOWED"})
+            self.assertEqual(self.server.engine.store.snapshot(), before)
+            self.assertEqual(state_path.read_bytes(), before_bytes)
+            self.assertEqual(before["next_job"], 1)
+
+        status, body = self.request(
+            "/chat",
+            {
+                "user_input": 'SUBMIT JOBQ(JOBS/BATCH) CMD("CRTLIB LIB(FROMHTTP)")',
+                "session_id": "jobs",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("J000001", body["response"])
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = RAPPServer(
+            ("127.0.0.1", 0),
+            state_path,
+            self.work / "stop.capability",
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        status, body = self.request(
+            "/chat",
+            {
+                "user_input": "WORK JOBQ(JOBS/BATCH); RUN JOB(J000001); DSPLIB LIB(FROMHTTP)",
+                "session_id": "worker",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Job J000001 COMPLETE", body["response"])
+        self.assertIn("FROMHTTP", body["response"])
+
     def test_unpaired_surrogate_is_exact_raw_http_422_refusal(self) -> None:
         request = urllib.request.Request(
             self.base + "/chat",

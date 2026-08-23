@@ -18,7 +18,7 @@ double-quoted and are never evaluated.
 | `CRTJOBQ`, `SUBMIT`, `WORK`, `RUN` | Create and operate a job queue |
 | `PRINT FILE(...) [WHERE(...)] [TITLE(...)]` | Save and return a report |
 
-Supported fields are `CHAR(1..256)`, signed 64-bit `INT`, and
+Supported fields are `CHAR(1..256)` (exactly one length argument), signed 64-bit `INT`, and
 `DECIMAL(precision,scale)` with precision 1–38. Decimal and integer values are
 persisted canonically as strings, avoiding JSON floating-point loss.
 `WHERE` values use the same canonicalization as inserted and updated values:

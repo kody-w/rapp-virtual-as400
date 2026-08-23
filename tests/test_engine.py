@@ -68,6 +68,27 @@ class EngineTests(EngineTestCase):
             self.engine.chat("CRTLIB LIB(ROLLBACK); INSERT FILE(ROLLBACK/MISSING) VALUES(A='x')", "s")
         self.assertNotIn("ROLLBACK", self.engine.store.snapshot()["libraries"])
 
+    def test_char_accepts_one_length_and_rejects_every_second_argument_atomically(self) -> None:
+        self.engine.chat("CRTLIB LIB(SCHEMA)", "setup")
+        self.engine.chat("CRTPF FILE(SCHEMA/GOOD) FIELDS(V:CHAR(10))", "schema")
+        good = self.engine.store.snapshot()["libraries"]["SCHEMA"]["files"]["GOOD"]["fields"][0]
+        self.assertEqual(good, {"name": "V", "type": "CHAR", "precision": 10, "scale": 0})
+
+        for suffix in ("0", "2"):
+            before = self.engine.store.snapshot()
+            before_bytes = (self.work / "state.json").read_bytes()
+            command = (
+                f"CRTLIB LIB(BAD{suffix}); "
+                f"CRTPF FILE(BAD{suffix}/F) FIELDS(V:CHAR(10,{suffix}))"
+            )
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(
+                Refusal, "CHAR takes exactly one length"
+            ) as caught:
+                self.engine.chat(command, "schema")
+            self.assertEqual(caught.exception.code, "INVALID_SCHEMA")
+            self.assertEqual(self.engine.store.snapshot(), before)
+            self.assertEqual((self.work / "state.json").read_bytes(), before_bytes)
+
     def test_idempotency_and_sessions_persist(self) -> None:
         first = self.engine.chat("CRTLIB LIB(ONCE)", "session-a", "key-1")
         second = self.engine.chat("CRTLIB LIB(ONCE)", "session-a", "key-1")
@@ -122,6 +143,37 @@ class EngineTests(EngineTestCase):
         self.assertIn("Job J000001 COMPLETE", output)
         self.assertIn("Spool report S000001", output)
         self.assertIn("Synthetic Inventory", output)
+
+    def test_submit_validates_embedded_command_before_job_allocation_and_restart(self) -> None:
+        self.engine.chat("CRTLIB LIB(TEST); CRTJOBQ JOBQ(TEST/BATCH)", "setup")
+        invalid = (
+            'SUBMIT JOBQ(TEST/BATCH) CMD("CRTLIB")',
+            'SUBMIT JOBQ(TEST/BATCH) CMD("CRTLIB LIB(NEVER) EXTRA(x)")',
+            'SUBMIT JOBQ(TEST/BATCH) CMD("CRTLIB LIB(ONE); CRTLIB LIB(TWO)")',
+            'SUBMIT JOBQ(TEST/BATCH) CMD("SUBMIT JOBQ(TEST/BATCH) CMD(\'DSPLIB\')")',
+            'SUBMIT JOBQ(TEST/BATCH) CMD("WORK JOBQ(TEST/BATCH)")',
+            'SUBMIT JOBQ(TEST/BATCH) CMD("RUN JOB(J000001)")',
+        )
+        for command in invalid:
+            before = self.engine.store.snapshot()
+            before_bytes = (self.work / "state.json").read_bytes()
+            with self.subTest(command=command), self.assertRaises(Refusal):
+                self.engine.chat(command, "submit")
+            self.assertEqual(self.engine.store.snapshot(), before)
+            self.assertEqual((self.work / "state.json").read_bytes(), before_bytes)
+            self.assertEqual(before["next_job"], 1)
+            self.assertEqual(before["jobs"], {})
+            self.assertEqual(before["job_queues"]["TEST/BATCH"], [])
+
+        submitted = self.engine.chat(
+            'SUBMIT JOBQ(TEST/BATCH) CMD("CRTLIB LIB(FROMJOB)")',
+            "submit",
+        )
+        self.assertIn("J000001", submitted["response"])
+        restarted = VirtualAS400(self.work / "state.json")
+        self.assertIn("READY", restarted.chat("WORK JOBQ(TEST/BATCH)", "worker")["response"])
+        self.assertIn("COMPLETE", restarted.chat("RUN JOB(J000001)", "worker")["response"])
+        self.assertIn("FROMJOB", restarted.store.snapshot()["libraries"])
 
     def test_six_digit_job_and_spool_identifier_exhaustion_is_stable(self) -> None:
         self.engine.chat(

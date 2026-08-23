@@ -465,16 +465,8 @@ class AtomicStore:
             if job["status"] != "COMPLETE" and job["result"] != "":
                 invalid("Restore snapshot has a premature job result.")
             try:
-                commands = parse_batch(job["command"])
+                engine_module.VirtualAS400._validated_submitted_command(job["command"])
             except Refusal:
-                invalid("Restore snapshot has an invalid job command.")
-            if len(commands) != 1 or commands[0].verb in {"SUBMIT", "WORK", "RUN"}:
-                invalid("Restore snapshot has a non-runnable job command.")
-            keys = set(commands[0].clauses)
-            if (
-                keys - engine_module.ALLOWED_CLAUSES[commands[0].verb]
-                or engine_module.REQUIRED_CLAUSES[commands[0].verb] - keys
-            ):
                 invalid("Restore snapshot has an invalid job command.")
         if set(queued_ids) - set(snapshot["jobs"]):
             invalid("Restore snapshot queue references a missing job.")

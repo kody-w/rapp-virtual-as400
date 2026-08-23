@@ -67,6 +67,18 @@ class RestoreValidationTests(EngineTestCase):
         del bad_record_shape["libraries"]["TEST"]["files"]["ITEMS"]["records"][0]["PRICE"]
         cases["missing record field"] = bad_record_shape
 
+        bad_char_scale = copy.deepcopy(base)
+        bad_char_scale["libraries"]["TEST"]["files"]["ITEMS"]["fields"][0]["scale"] = 2
+        cases["CHAR field with scale"] = bad_char_scale
+
+        bad_job_missing_clause = copy.deepcopy(base)
+        bad_job_missing_clause["jobs"]["J000001"]["command"] = "CRTLIB"
+        cases["job command missing required clause"] = bad_job_missing_clause
+
+        bad_job_extra_clause = copy.deepcopy(base)
+        bad_job_extra_clause["jobs"]["J000001"]["command"] = "CRTLIB LIB(NEVER) EXTRA(x)"
+        cases["job command with unsupported clause"] = bad_job_extra_clause
+
         too_many_records = copy.deepcopy(base)
         record = too_many_records["libraries"]["TEST"]["files"]["ITEMS"]["records"][0]
         too_many_records["libraries"]["TEST"]["files"]["ITEMS"]["records"] = [
@@ -101,6 +113,7 @@ class RestoreValidationTests(EngineTestCase):
 
     def test_generated_snapshot_restores_and_allowlisted_job_flow_stays_safe(self) -> None:
         snapshot = self._rich_snapshot()
+        self.assertEqual(AtomicStore.validate_snapshot(snapshot), snapshot)
         target = VirtualAS400(self.work / "restored" / "state.json")
         target.store.restore(snapshot)
         worked = target.chat("WORK JOBQ(TEST/BATCH)", "after")

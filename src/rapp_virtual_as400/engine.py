@@ -242,6 +242,8 @@ class VirtualAS400:
             kind = type_match.group(1).upper()
             first = int(type_match.group(2) or (10 if kind == "DECIMAL" else 0))
             second = int(type_match.group(3) or 0)
+            if kind == "CHAR" and type_match.group(3) is not None:
+                raise Refusal("CHAR takes exactly one length.", "INVALID_SCHEMA")
             if kind == "CHAR" and not 1 <= first <= 256:
                 raise Refusal("CHAR length must be 1 through 256.", "INVALID_SCHEMA")
             if kind == "INT" and (type_match.group(2) or type_match.group(3)):
@@ -409,19 +411,26 @@ class VirtualAS400:
         key = "/".join(require_qualified(clauses["JOBQ"]))
         if key not in state["job_queues"]:
             raise Refusal(f"Job queue {key} does not exist.", "OBJECT_NOT_FOUND")
+        embedded = unquote(clauses["CMD"])
+        self._validated_submitted_command(embedded)
         if state["next_job"] > MAX_SIX_DIGIT_ID:
             raise Refusal("Job identifier space exhausted.", "LIMIT_EXCEEDED")
         if len(state["jobs"]) >= MAX_JOBS:
             raise Refusal("Job limit reached.", "LIMIT_EXCEEDED")
-        embedded = unquote(clauses["CMD"])
-        parsed = parse_batch(embedded)
-        if len(parsed) != 1 or parsed[0].verb in {"SUBMIT", "WORK", "RUN"}:
-            raise Refusal("Submitted jobs require one non-job command.", "COMMAND_NOT_ALLOWED")
         job_id = f"J{state['next_job']:06d}"
         state["next_job"] += 1
         state["jobs"][job_id] = {"queue": key, "command": embedded, "status": "QUEUED", "result": ""}
         state["job_queues"][key].append(job_id)
         return f"Job {job_id} submitted to {key}."
+
+    @classmethod
+    def _validated_submitted_command(cls, embedded: str) -> Command:
+        parsed = parse_batch(embedded)
+        if len(parsed) != 1 or parsed[0].verb in {"SUBMIT", "WORK", "RUN"}:
+            raise Refusal("Submitted jobs require one non-job command.", "COMMAND_NOT_ALLOWED")
+        command = parsed[0]
+        cls._validate_clauses(command)
+        return command
 
     def _do_work(self, state: dict, clauses: dict) -> str:
         key = "/".join(require_qualified(clauses["JOBQ"]))
@@ -441,8 +450,7 @@ class VirtualAS400:
         job = state["jobs"][job_id]
         if job["status"] != "READY":
             raise Refusal(f"Job {job_id} is {job['status']}, not READY.", "INVALID_STATE")
-        command = parse_batch(job["command"])[0]
-        self._validate_clauses(command)
+        command = self._validated_submitted_command(job["command"])
         result = self._execute(state, command)
         job["status"] = "COMPLETE"
         job["result"] = result

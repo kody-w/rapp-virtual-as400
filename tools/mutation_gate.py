@@ -111,6 +111,34 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "char-second-argument",
+        "engine.py",
+        '            if kind == "CHAR" and type_match.group(3) is not None:',
+        "            if False:",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import Refusal,VirtualAS400\n"
+            "e=VirtualAS400(Path('state.json')); e.chat('CRTLIB LIB(T)','s'); before=e.store.snapshot()\n"
+            "try: e.chat('CRTPF FILE(T/F) FIELDS(V:CHAR(10,0))','s')\n"
+            "except Refusal as error: raise SystemExit(0 if error.code=='INVALID_SCHEMA' and e.store.snapshot()==before else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
+        "submit-embedded-clause-validation",
+        "engine.py",
+        "        cls._validate_clauses(command)",
+        "        pass",
+        (
+            "from pathlib import Path\n"
+            "from rapp_virtual_as400 import Refusal,VirtualAS400\n"
+            "e=VirtualAS400(Path('state.json')); e.chat('CRTLIB LIB(T); CRTJOBQ JOBQ(T/Q)','s'); before=e.store.snapshot()\n"
+            "try: e.chat('SUBMIT JOBQ(T/Q) CMD(\"CRTLIB\")','s')\n"
+            "except Refusal: raise SystemExit(0 if e.store.snapshot()==before else 2)\n"
+            "raise SystemExit(1)\n"
+        ),
+    ),
+    Mutation(
         "unicode-surrogate-guard",
         "unicode_safe.py",
         'decode("utf-16-le")',

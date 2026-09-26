@@ -1,5 +1,9 @@
 # RAPP Virtual AS400
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-virtual-as400.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-virtual-as400.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 A **clean-room, local, educational prototype** of an operations neighborhood
 inspired by general IBM i / AS/400-era concepts: libraries, declared physical
 files, records, queues, jobs, and spool-like reports.
